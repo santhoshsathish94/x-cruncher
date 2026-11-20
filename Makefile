@@ -6,6 +6,7 @@ ifeq ($(OS),Windows_NT)
   SHARED_EXT := dll
   SHARED_FLAGS := -shared -DXCRUNCHER_BUILD_DLL -static
   DL_LIBS :=
+  PTHREAD_LIBS :=
   EXE := .exe
 else
   UNAME_S := $(shell uname -s)
@@ -13,10 +14,12 @@ else
     SHARED_EXT := dylib
     SHARED_FLAGS := -dynamiclib -fPIC
     DL_LIBS :=
+    PTHREAD_LIBS := -pthread
   else
     SHARED_EXT := so
     SHARED_FLAGS := -shared -fPIC
     DL_LIBS := -ldl
+    PTHREAD_LIBS := -pthread
   endif
   EXE :=
 endif
@@ -34,7 +37,7 @@ $(SHARED_LIB): src/xcruncher.c include/xcruncher.h
 	$(CC) $(CFLAGS) $(SHARED_FLAGS) src/xcruncher.c -o $(SHARED_LIB) $(LDFLAGS)
 
 test_xcruncher$(EXE): tests/test_xcruncher.c src/xcruncher.c include/xcruncher.h
-	$(CC) $(CFLAGS) tests/test_xcruncher.c src/xcruncher.c -o test_xcruncher$(EXE) $(LDFLAGS)
+	$(CC) $(CFLAGS) tests/test_xcruncher.c src/xcruncher.c -o test_xcruncher$(EXE) $(LDFLAGS) $(PTHREAD_LIBS)
 
 bench_xcruncher$(EXE): bench/bench_xcruncher.c src/xcruncher.c include/xcruncher.h
 	$(CC) $(CFLAGS) bench/bench_xcruncher.c src/xcruncher.c -o bench_xcruncher$(EXE) $(LDFLAGS) $(DL_LIBS)

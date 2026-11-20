@@ -40,6 +40,23 @@ jobs:
           ctest --test-dir build --output-on-failure -C Release
           python tests/test_python.py
 
+      - name: Build & Verify Standalone Platform Wheel (Clean-Room Venv)
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip build wheel setuptools
+          python -m build --wheel --outdir dist-wheel
+          CLEAN_DIR="${RUNNER_TEMP}/xc_rel_wheel_check"
+          rm -rf "${CLEAN_DIR}" && mkdir -p "${CLEAN_DIR}"
+          python -m venv "${CLEAN_DIR}/venv"
+          if [ -x "${CLEAN_DIR}/venv/bin/python" ]; then
+            VP="${CLEAN_DIR}/venv/bin/python"
+          else
+            VP="${CLEAN_DIR}/venv/Scripts/python.exe"
+          fi
+          "${VP}" -m pip install dist-wheel/*.whl
+          cp tests/test_python.py "${CLEAN_DIR}/test_python.py"
+          (cd "${CLEAN_DIR}" && "${VP}" test_python.py)
+
       - name: Stage Release Bundle (Unix)
         if: runner.os != 'Windows'
         run: |
@@ -70,7 +87,7 @@ jobs:
           $Hash = (Get-FileHash "$Dir.zip" -Algorithm SHA256).Hash.ToLower()
           "$Hash  $Dir.zip" | Out-File -Encoding ascii "$Dir.zip.sha256"
 
-      - name: Upload Native Bundle
+      - name: Upload Native Bundle & Platform Wheel
         uses: actions/upload-artifact@v4
         with:
           name: ${{ matrix.artifact }}
@@ -79,6 +96,7 @@ jobs:
             *.tar.gz.sha256
             *.zip
             *.zip.sha256
+            dist-wheel/*.whl
 
   package-python:
     runs-on: ubuntu-latest
@@ -87,15 +105,22 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
-      - name: Build Python Source Distribution & Wheel
+      - name: Build & Verify Python Source Distribution in Clean-Room Venv
         run: |
-          python -m pip install --upgrade build
-          python -m build
-          shasum -a 256 dist/* > dist/SHA256SUMS.txt
-      - uses: actions/upload-artifact@v4
+          python -m pip install --upgrade pip build wheel setuptools
+          python -m build --sdist --outdir dist
+          CLEAN_DIR="${RUNNER_TEMP}/xc_rel_sdist_check"
+          rm -rf "${CLEAN_DIR}" && mkdir -p "${CLEAN_DIR}"
+          python -m venv "${CLEAN_DIR}/venv"
+          "${CLEAN_DIR}/venv/bin/python" -m pip install --upgrade pip wheel setuptools
+          "${CLEAN_DIR}/venv/bin/python" -m pip install dist/*.tar.gz
+          cp tests/test_python.py "${CLEAN_DIR}/test_python.py"
+          (cd "${CLEAN_DIR}" && "${CLEAN_DIR}/venv/bin/python" test_python.py)
+      - name: Upload Python Source Distribution
+        uses: actions/upload-artifact@v4
         with:
-          name: python-dist
-          path: dist/*
+          name: python-sdist
+          path: dist/*.tar.gz
 
   publish-release:
     needs: [package-native, package-python]
@@ -109,33 +134,44 @@ jobs:
           path: release-assets
           merge-multiple: true
 
-      - name: Extract Release Notes
+      - name: Generate Unified SHA256SUMS & Tag-Matched Release Notes
+        shell: python
         run: |
-          cat > RELEASE_BODY.md << 'EOF'
-          ## x-cruncher v1.6.0 — Open-source high-performance integer multiplication
+          import hashlib, os, pathlib, re
 
-          `x-cruncher v1.6.0` is an MIT-licensed, zero-dependency C11 library and Python package for exact arbitrary-precision integer multiplication and zero-storage hexadecimal $\pi$ digit extraction.
+          assets_dir = pathlib.Path("release-assets")
+          sums = []
+          for p in sorted(assets_dir.iterdir()):
+              if p.is_file() and p.suffix in {".gz", ".zip", ".whl"}:
+                  h = hashlib.sha256(p.read_bytes()).hexdigest()
+                  sums.append(f"{h}  {p.name}")
+          (assets_dir / "SHA256SUMS.txt").write_text("\n".join(sums) + "\n", encoding="utf-8")
 
-          ### Highlights
-          - **Exact Integer Arithmetic:** Deterministic integer exactness across all input bit-patterns (verified bit-for-bit against `GNU GMP` and adversarial limb-saturation tests under `ASan + UBSan`).
-          - **51-Bit Table-Free Lazy Harvey `[0, 2P)` NTT (`AVX-512 IFMA52 + VBMI`):** Uses two 51-bit primes (`2P < 2^52`) over signed `40-bit` Carry-Free Vedic *Vinculum* limbs `[-2^39, +2^39]` with 4-cursor fused Four-Step Radix-4 twiddles and signed `102-bit` Garner CRT.
-          - **Reusable Plans, `WaveTrunk`, Squaring & Sparse `NAF`:** Pre-transformed constant operands (`xc_trunk_t`), automatic `A * A` squaring, and near-$2^k$ sparse fast-paths.
-          - **Single-Binary Portability:** Runtime dispatch across `AVX-512 IFMA52`, `AVX-512`, `AVX2+FMA`, `ARM64 NEON`, and portable C11 scalar fallbacks on Linux, Windows, macOS, and Android.
-          - **Reproducibility Suite:** Includes [`docs/BENCHMARKS.md`](https://github.com/santhoshsathish94/x-cruncher/blob/v1.6.0/docs/BENCHMARKS.md), [`docs/ARCHITECTURE.md`](https://github.com/santhoshsathish94/x-cruncher/blob/v1.6.0/docs/ARCHITECTURE.md), [`CONTRIBUTING.md`](https://github.com/santhoshsathish94/x-cruncher/blob/v1.6.0/CONTRIBUTING.md), and standalone raw-limb benchmark harness `bench/repro_raw_limbs.c` (`make repro`).
+          tag = os.environ["GITHUB_REF_NAME"]
+          ver = tag.lstrip("v")
+          cl = pathlib.Path("CHANGELOG.md").read_text(encoding="utf-8")
+          m = re.search(rf"^## \[{re.escape(ver)}\][^\n]*\n(.*?)(?=^## \[|\Z)", cl, flags=re.M | re.S)
+          changelog_sec = m.group(1).strip() if m else "See CHANGELOG.md for details."
+          changelog_sec = changelog_sec.rstrip("-").strip()
 
-          ### Quick Reproducible Verification
-          ```bash
-          git clone --branch v1.6.0 https://github.com/santhoshsathish94/x-cruncher.git
-          cd x-cruncher
-          make clean all
-          make test
-          make bench-100m
-          make repro
-          ```
-
-          See [`docs/BENCHMARKS.md`](https://github.com/santhoshsathish94/x-cruncher/blob/v1.6.0/docs/BENCHMARKS.md) and [`README.md#known-limitations-v160`](https://github.com/santhoshsathish94/x-cruncher/blob/v1.6.0/README.md#known-limitations-v160) for full hardware configurations, `1T` / `4T` / `16C` results, and `GNU GMP` / `y-cruncher` comparison methodology & limitations.
-          EOF
-          sed -i 's/^          //' RELEASE_BODY.md
+          lines = [
+              f"## x-cruncher {tag} — Open-source high-performance integer multiplication",
+              "",
+              f"`x-cruncher {tag}` is an MIT-licensed, zero-dependency C11 library and Python package for exact arbitrary-precision integer multiplication and zero-storage hexadecimal $\\pi$ digit extraction.",
+              "",
+              f"### Changes in {tag}",
+              changelog_sec,
+              "",
+              "### Quick Reproducible Verification",
+              "```bash",
+              f"git clone --branch {tag} https://github.com/santhoshsathish94/x-cruncher.git",
+              "cd x-cruncher",
+              "make clean all && make test && make bench-100m && make repro",
+              "```",
+              "",
+              f"See [`docs/BENCHMARKS.md`](https://github.com/santhoshsathish94/x-cruncher/blob/{tag}/docs/BENCHMARKS.md), [`docs/ARCHITECTURE.md`](https://github.com/santhoshsathish94/x-cruncher/blob/{tag}/docs/ARCHITECTURE.md), and [`README.md`](https://github.com/santhoshsathish94/x-cruncher/blob/{tag}/README.md) for full hardware configurations, `1T` / `4T` / `16C` results, concurrency guarantees, and `GNU GMP` / `y-cruncher` comparison methodology & limitations.",
+          ]
+          pathlib.Path("RELEASE_BODY.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
 
       - name: Publish GitHub Release
         uses: softprops/action-gh-release@v2

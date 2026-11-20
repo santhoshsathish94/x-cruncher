@@ -1,21 +1,20 @@
 [build-system]
-requires = ["setuptools>=64"]
+requires = ["setuptools>=77", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "x-cruncher"
-version = "1.6.0"
-description = "y-cruncher-tier arbitrary-precision integer multiplication engine (16-bit Crandall-Fagin Vedic Wave + WaveTrunks + Sparse NAF)"
+version = "1.6.1"
+description = "Open-source high-performance integer multiplication & zero-storage Pi extraction (51-bit AVX-512 IFMA52 NTT + Crandall-Fagin Vedic Wave + Sparse NAF)"
 readme = "README.md"
-license = {text = "MIT"}
+license = "MIT"
 authors = [{name = "Santhosh Narayanan", email = "santhoshsathish94@gmail.com"}]
 requires-python = ">=3.9"
-keywords = ["bigint", "multiplication", "fft", "avx512", "vedic-math", "high-performance", "number-theory"]
+keywords = ["bigint", "multiplication", "ntt", "fft", "avx512", "vedic-math", "high-performance", "number-theory"]
 classifiers = [
     "Development Status :: 5 - Production/Stable",
     "Intended Audience :: Developers",
     "Intended Audience :: Science/Research",
-    "License :: OSI Approved :: MIT License",
     "Programming Language :: C",
     "Programming Language :: Python :: 3",
     "Topic :: Scientific/Engineering :: Mathematics",
@@ -24,3 +23,7 @@ classifiers = [
 [tool.setuptools]
 package-dir = {"" = "python"}
 packages = ["xcruncher"]
+include-package-data = true
+
+[tool.setuptools.package-data]
+xcruncher = ["*.so", "*.dll", "*.dylib", "_csrc/*.c", "_csrc/*.h"]

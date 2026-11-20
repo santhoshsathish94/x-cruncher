@@ -1,4 +1,4 @@
-# Reproducible Benchmarks (`x-cruncher v1.6.0`)
+# Reproducible Benchmarks (`x-cruncher v1.6.1`)
 
 Reproducibility is a first-class requirement of `x-cruncher`. Every benchmark reported in this repository includes the exact hardware, OS/kernel, compiler flags, thread count, and shell commands needed for another developer to verify both **speed** and **bit-for-bit exactness**.
 
@@ -112,5 +112,6 @@ To interpret benchmark comparisons fairly and accurately:
    - `x-cruncher` computes the **complete `200,000,000`-digit (`~664.4M`-bit) exact integer product** from `64-bit` binary limbs (`uint64_t[]`). While `100M`-digit $\pi \times \pi$ tests use the same mathematical scale, the internal binary representations and output precisions are not bit-for-bit identical workloads.
 3. **Cold First Call vs Subsequent Calls (Demand Paging):**
    - The very first large `xc_mul_u64` call in a fresh OS process allocates `~268 MB` (squaring) or `~536 MB` (`A * B`) via `mmap` and faults pages into physical RAM (`Run 1`: `~210 ms` on 4 threads / `~110 ms` on 16 threads). Subsequent calls reuse the lock-free 1-slot cached workspace (`Run 2+`: `~140 ms` on 4 threads / `~37–38 ms` on 16 threads). Applications performing a single one-shot multiplication before process exit will observe the `Run 1` cold-page cost.
-4. **Cloud VM & SMT Scheduling Variance:**
-   - Virtualized cloud instances (`4 vCPU` quotas, shared L3 caches, hypervisor steal time, or background `khugepaged` compaction) typically exhibit `5%–25%` higher run-to-run variance than bare-metal pinned cores. Always report **at least 5–7 runs** (`Best`, `Median`, and `Worst`).
+4. **Cloud VM & SMT Scheduling Variance (`Best` vs `Median`):**
+   - Virtualized cloud instances (`4 vCPU` quotas, shared L3 caches, hypervisor steal time, or background `khugepaged` compaction) typically exhibit `5%–25%` higher run-to-run variance than bare-metal pinned cores.
+   - Note the reporting distinction between the two benchmark tools: `bench_xcruncher` reports **best-of-repetitions** (designed to filter OS scheduling interrupts on sub-millisecond `1K–1M` kernels), whereas `repro_raw_limbs` reports **Best, Median, and Worst** across `N` runs (recommended whenever publishing `10M–100M` multi-core comparisons).

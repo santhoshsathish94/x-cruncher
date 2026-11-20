@@ -1,6 +1,6 @@
-# x-cruncher v1.6.0 Architecture Reference
+# x-cruncher v1.6.1 Architecture Reference
 
-This document specifies the internal mathematical foundations, worst-case exactness proofs, SIMD kernels, memory layout, and fallback hierarchy of `x-cruncher v1.6.0` ([`src/xcruncher.c`](../src/xcruncher.c)).
+This document specifies the internal mathematical foundations, worst-case exactness proofs, SIMD kernels, memory layout, concurrency model, and fallback hierarchy of `x-cruncher v1.6.1` ([`src/xcruncher.c`](../src/xcruncher.c)).
 
 ---
 
@@ -98,16 +98,22 @@ Even if **every** balanced limb equals $+2^{B-1}$ with zero sign cancellation, t
 
 ## 4. Zero-Storage $N$-th Hexadecimal $\pi$ Extractor (`xc_pi_hex_digits`)
 
-`xc_pi_hex_digits(offset, out_hex, count)` extracts up to `20` exact hexadecimal digits (`80` bits) of $\pi$ starting at `16^-offset` (`0`-indexed after `3.`) using `< 1 KB` of stack/register state and `0` bytes of heap or disk storage via Huvent's $2^{-12k}$ binary BBP-Bellard series:
+`xc_pi_hex_digits(offset, out_hex, count)` extracts up to `20` exact hexadecimal digits (`80` bits) of $\pi$ starting at `16^-offset` (`0`-indexed after `3.`) for **`0 <= offset <= 2^44` (`17,592,186,044,416`, $\approx 1.76 \times 10^{13}$)** using `< 1 KB` of stack/register state and `0` bytes of heap or disk storage via Huvent's $2^{-12k}$ binary BBP-Bellard series (returning `XC_ERR_ARG` for `offset > 2^44`):
 
-- **`AVX-512 IFMA52`:** Packs all 8 odd-denominator terms into a single `ZMM` register with identical shift exponents across lanes; uses 3-cycle centered `double` Barrett squaring for moduli $m < 90\text{M}$ and `6×`-interleaved self-reducing Seiler `IFMA52` Montgomery squaring above $90\text{M}$ into `104-bit` fixed-point accumulators.
-- **`AVX2+FMA`:** `2×`-interleaved **Dekker–FMA `106-bit`** exact modular exponentiation (`vfmadd213pd` + `vfmsub213pd` error-free product transformation) for moduli up to $2^{50}$.
-- **`ARM64 NEON`:** `float64x2_t` hardware FMA (`vfmaq_f64`) + `vrndnq_f64` + `vcvtnq_s64_f64` dual-term modular exponentiation with portable `64×64 -> 128-bit` fallback above $90\text{M}$.
+- **`AVX-512 IFMA52` (`0 <= offset <= 2^44`):** Packs all 8 odd-denominator terms into a single `ZMM` register with identical shift exponents across lanes; uses 3-cycle centered `double` Barrett squaring for moduli $m < 90\text{M}$ and `6×`-interleaved self-reducing Seiler `IFMA52` Montgomery squaring above $90\text{M}$ into `104-bit` fixed-point accumulators.
+- **`AVX2+FMA` (`0 <= offset <= 2^42`, `128-bit` integer fallback up to `2^44`):** `2×`-interleaved **Dekker–FMA `106-bit`** exact modular exponentiation (`vfmadd213pd` + `vfmsub213pd` error-free product transformation) for moduli up to $2^{46}$, falling back automatically to exact `128-bit` integer modular exponentiation for `2^42 < offset <= 2^44`.
+- **`ARM64 NEON` (`0 <= offset <= 2^42`, `128-bit` integer fallback up to `2^44`):** `float64x2_t` hardware FMA (`vfmaq_f64`) + `vrndnq_f64` + `vcvtnq_s64_f64` dual-term modular exponentiation below $90\text{M}$ with exact `64×64 -> 128-bit` integer fallback above $90\text{M}$.
 
 ---
 
-## 5. Memory Management, Caching & Threading Model
+## 5. Memory Management, Caching & Concurrency Contract
 
-- **Lock-Free 1-Slot Workspace Caches (`g_cached_ntt`, `g_cached_wave_plan`):** One-shot `xc_mul_u64` atomically acquires (`__atomic_exchange_n`) and recycles a single NTT or Wave workspace across repeated calls of the same `logN` / `(B, log_c)`, eliminating `~30 ms` of OS `mmap/munmap` page-fault overhead on repeated calls while remaining `100%` thread-safe if called concurrently (concurrent callers allocate independent workspaces). Both caches release memory in `__attribute__((destructor))` at library unload (`0` LeakSanitizer leaks).
+- **Thread-Safe One-Shot & Stateless APIs:** `xc_mul_u64`, `xc_mul_u64_lowmem`, `xc_pi_hex_digits`, `xc_from_decimal`, `xc_to_decimal`, `xc_mul_decimal`, `xc_active_isa_name`, and `xc_version` are **safe for concurrent calls across multiple application threads** (assuming callers pass distinct `out` buffers).
+  - **Thread-Local Diagnostics:** `g_last_path`, `g_last_uniq`, and `g_last_bits` use `XC_THREAD_LOCAL` (`_Thread_local` / `__declspec(thread)`), so `xc_last_path_used()`, `xc_last_unique_slices()`, and `xc_last_limb_bits()` reflect the calling thread's most recent operation without cross-thread data races.
+  - **Atomic One-Time ISA & Topology Initialization:** `__builtin_cpu_init()` is guarded by a 3-state acquire/release atomic once-latch (`xc_cpu_init_once`), and all cached ISA/topology integers (`xc_detect_isa`, `xc_has_ifma_ntt`, `xc_has_ifma52`, `xc_wave_threads`, `xc_compute_threads`) use acquire/release atomic loads and stores (`ThreadSanitizer` clean).
+- **Reusable Plan & Trunk Ownership (`xc_plan_t` vs `xc_trunk_t`):**
+  - A single `xc_plan_t` owns mutable scratch matrices (`Az`, `Bz`, `A1`, `A2`, `tbufs`) and **must not** be invoked concurrently from multiple threads at the same time; multi-threaded callers using plans should allocate one `xc_plan_t` per thread.
+  - Once built via `xc_trunk_create`, a `const xc_trunk_t *` is immutable and **may** be shared read-only across concurrent threads that each supply their own compatible `xc_plan_t`.
+- **Lock-Free 1-Slot Workspace Caches (`g_cached_ntt`, `g_cached_wave_plan`):** One-shot `xc_mul_u64` atomically acquires (`__atomic_exchange_n`) and recycles a single NTT or Wave workspace across sequential calls of the same `logN` / `(B, log_c)`. Concurrent callers that miss the empty slot transparently allocate an independent temporary workspace and either populate the cache or free on return. Both caches release memory in `__attribute__((destructor))` at library unload (`0` LeakSanitizer leaks).
 - **Transparent Huge Pages (`2 MB` THP):** Allocations $\ge 2\text{ MB}$ on Linux issue `madvise(..., MADV_HUGEPAGE)` regardless of thread count, avoiding `68,000+` `4 KB` DTLB page-table walks during strided `268 MB` Four-Step matrix transposes.
 - **Universal Topology & Quota Detection (`xc_wave_threads`):** Honors explicit `OMP_NUM_THREADS` first; otherwise inspects Linux `sched_getaffinity` distinct `(package_id, core_id)` pairs, cgroup v1/v2 `cpu.max` container/VM quotas, Windows `GetLogicalProcessorInformation`, and macOS core counts — never mutating caller thread affinity.

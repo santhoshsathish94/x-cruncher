@@ -1,10 +1,11 @@
 cmake_minimum_required(VERSION 3.16)
-project(xcruncher VERSION 1.6.0 LANGUAGES C)
+project(xcruncher VERSION 1.6.1 LANGUAGES C)
 
 set(CMAKE_C_STANDARD 11)
 set(CMAKE_C_STANDARD_REQUIRED ON)
 
 find_package(OpenMP)
+find_package(Threads REQUIRED)
 
 add_library(xcruncher SHARED src/xcruncher.c)
 target_include_directories(xcruncher PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
@@ -34,7 +35,7 @@ endif()
 
 enable_testing()
 add_executable(test_xcruncher tests/test_xcruncher.c)
-target_link_libraries(test_xcruncher PRIVATE xcruncher_static)
+target_link_libraries(test_xcruncher PRIVATE xcruncher_static Threads::Threads)
 if(MSVC)
     target_link_options(test_xcruncher PRIVATE /STACK:8388608)
 else()

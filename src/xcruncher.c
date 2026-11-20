@@ -57,10 +57,40 @@
 #define C5_2 -0.80901699437494742410229341718281905886
 #define S5_2 -0.58778525229247312916870595463907276859
 
-/* Diagnostic state */
-static xc_path_t g_last_path = XC_PATH_ZERO;
-static int       g_last_uniq = 0;
-static int       g_last_bits = 16;
+/* Thread-local diagnostic state & portable acquire/release int atomics */
+#if defined(_MSC_VER)
+  #define XC_THREAD_LOCAL __declspec(thread)
+#elif defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L && !defined(__STDC_NO_THREADS__)
+  #define XC_THREAD_LOCAL _Thread_local
+#elif defined(__GNUC__) || defined(__clang__)
+  #define XC_THREAD_LOCAL __thread
+#else
+  #define XC_THREAD_LOCAL
+#endif
+
+static inline int xc_atomic_load_i32(const volatile int *p) {
+#if defined(__GNUC__) || defined(__clang__)
+    return __atomic_load_n(p, __ATOMIC_ACQUIRE);
+#elif defined(_WIN32)
+    return (int)InterlockedCompareExchange((volatile LONG *)p, 0, 0);
+#else
+    return *p;
+#endif
+}
+
+static inline void xc_atomic_store_i32(volatile int *p, int v) {
+#if defined(__GNUC__) || defined(__clang__)
+    __atomic_store_n(p, v, __ATOMIC_RELEASE);
+#elif defined(_WIN32)
+    InterlockedExchange((volatile LONG *)p, (LONG)v);
+#else
+    *p = v;
+#endif
+}
+
+static XC_THREAD_LOCAL xc_path_t g_last_path = XC_PATH_ZERO;
+static XC_THREAD_LOCAL int       g_last_uniq = 0;
+static XC_THREAD_LOCAL int       g_last_bits = 16;
 
 /* =========================================================================================
  * CROSS-PLATFORM ALIGNED / HUGEPAGE ALLOCATOR & THREAD TOPOLOGY
@@ -212,18 +242,20 @@ static int xc_compute_threads(void) {
     if (max_t <= 1) return 1;
     const char *env_omp = getenv("OMP_NUM_THREADS");
     if (env_omp && env_omp[0] != '\0') return max_t;
-    static int cached_ct = 0;
-    if (cached_ct == 0) {
+    static volatile int cached_ct = 0;
+    int ct = xc_atomic_load_i32(&cached_ct);
+    if (ct == 0) {
   #if defined(__linux__)
         int logical = max_t, phys = max_t;
         xc_linux_detect_topology(max_t, &logical, &phys);
         (void)phys;
-        cached_ct = logical;
+        ct = logical;
   #else
-        cached_ct = max_t;
+        ct = max_t;
   #endif
+        xc_atomic_store_i32(&cached_ct, ct);
     }
-    return cached_ct;
+    return ct;
 #else
     return 1;
 #endif
@@ -243,16 +275,17 @@ static int xc_wave_threads(size_t M) {
         int mt = omp_get_max_threads();
         return (mt > 0) ? mt : 1;
     }
-    static int best_nt = 0;
-    if (best_nt == 0) {
+    static volatile int best_nt = 0;
+    int nt = xc_atomic_load_i32(&best_nt);
+    if (nt == 0) {
         int max_t = omp_get_max_threads();
   #if defined(__linux__)
         int logical = max_t, phys = max_t;
         xc_linux_detect_topology(max_t, &logical, &phys);
-        if (logical >= 16 && phys >= 8 && logical >= 2 * phys) best_nt = phys;
-        else best_nt = logical;
+        if (logical >= 16 && phys >= 8 && logical >= 2 * phys) nt = phys;
+        else nt = logical;
   #elif defined(__APPLE__)
-        best_nt = (max_t > 0) ? max_t : 1; /* Apple Silicon has no SMT */
+        nt = (max_t > 0) ? max_t : 1; /* Apple Silicon has no SMT */
   #elif defined(_WIN32)
         int phys = 0;
         DWORD len = 0;
@@ -269,13 +302,14 @@ static int xc_wave_threads(size_t M) {
                 free(slpi);
             }
         }
-        if (max_t >= 16 && phys >= 8 && max_t >= 2 * phys) best_nt = phys;
-        else best_nt = (max_t > 0) ? max_t : 1;
+        if (max_t >= 16 && phys >= 8 && max_t >= 2 * phys) nt = phys;
+        else nt = (max_t > 0) ? max_t : 1;
   #else
-        best_nt = (max_t >= 24) ? (max_t / 2) : (max_t > 0 ? max_t : 1);
+        nt = (max_t >= 24) ? (max_t / 2) : (max_t > 0 ? max_t : 1);
   #endif
+        xc_atomic_store_i32(&best_nt, nt);
     }
-    return best_nt;
+    return nt;
 #else
     (void)M;
     return 1;
@@ -305,43 +339,60 @@ typedef enum {
   #define XC_TARGET_AVX2
 #endif
 
+#if XC_HAS_X86_SIMD
+static void xc_cpu_init_once(void) {
+    static volatile int state = 0; /* 0 = uninit, 1 = busy, 2 = done */
+    if (__atomic_load_n(&state, __ATOMIC_ACQUIRE) == 2) return;
+    int expected = 0;
+    if (__atomic_compare_exchange_n(&state, &expected, 1, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) {
+        __builtin_cpu_init();
+        __atomic_store_n(&state, 2, __ATOMIC_RELEASE);
+    } else {
+        while (__atomic_load_n(&state, __ATOMIC_ACQUIRE) != 2) {
+            __builtin_ia32_pause();
+        }
+    }
+}
+#endif
+
 static int xc_has_ifma_ntt(void) {
 #if XC_HAS_X86_SIMD
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    __builtin_cpu_init();
-    cached = (__builtin_cpu_supports("avx512f") &&
-              __builtin_cpu_supports("avx512ifma") &&
-              __builtin_cpu_supports("avx512dq") &&
-              __builtin_cpu_supports("avx512vl") &&
-              __builtin_cpu_supports("avx512bw") &&
-              __builtin_cpu_supports("avx512vbmi")) ? 1 : 0;
-    return cached;
+    static volatile int cached = -1;
+    int v = xc_atomic_load_i32(&cached);
+    if (v >= 0) return v;
+    xc_cpu_init_once();
+    v = (__builtin_cpu_supports("avx512f") &&
+         __builtin_cpu_supports("avx512ifma") &&
+         __builtin_cpu_supports("avx512dq") &&
+         __builtin_cpu_supports("avx512vl") &&
+         __builtin_cpu_supports("avx512bw") &&
+         __builtin_cpu_supports("avx512vbmi")) ? 1 : 0;
+    xc_atomic_store_i32(&cached, v);
+    return v;
 #else
     return 0;
 #endif
 }
 
 static xc_isa_t xc_detect_isa(void) {
-    static int cached = -1;
-    if (cached >= 0) return (xc_isa_t)cached;
+    static volatile int cached = -1;
+    int v = xc_atomic_load_i32(&cached);
+    if (v >= 0) return (xc_isa_t)v;
+    xc_isa_t res = XC_ISA_SCALAR;
 #if XC_HAS_X86_SIMD
-    __builtin_cpu_init();
+    xc_cpu_init_once();
     if (__builtin_cpu_supports("avx512f") &&
         __builtin_cpu_supports("avx512dq") &&
         __builtin_cpu_supports("avx512bw") &&
         __builtin_cpu_supports("avx512vl") &&
         __builtin_cpu_supports("fma")) {
-        cached = XC_ISA_AVX512;
-        return XC_ISA_AVX512;
-    }
-    if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
-        cached = XC_ISA_AVX2;
-        return XC_ISA_AVX2;
+        res = XC_ISA_AVX512;
+    } else if (__builtin_cpu_supports("avx2") && __builtin_cpu_supports("fma")) {
+        res = XC_ISA_AVX2;
     }
 #endif
-    cached = XC_ISA_SCALAR;
-    return XC_ISA_SCALAR;
+    xc_atomic_store_i32(&cached, (int)res);
+    return res;
 }
 
 XC_API const char *xc_version(void) { return XCRUNCHER_VERSION; }
@@ -4081,15 +4132,17 @@ static void pi_hex_term_range_scalar(int64_t B_exp, uint64_t k_beg, uint64_t k_e
 
 #if XC_HAS_X86_SIMD
 static int xc_has_ifma52(void) {
-    static int cached = -1;
-    if (cached >= 0) return cached;
-    __builtin_cpu_init();
-    cached = (__builtin_cpu_supports("avx512f") &&
-              __builtin_cpu_supports("avx512ifma") &&
-              __builtin_cpu_supports("avx512dq") &&
-              __builtin_cpu_supports("avx512vl") &&
-              __builtin_cpu_supports("fma")) ? 1 : 0;
-    return cached;
+    static volatile int cached = -1;
+    int v = xc_atomic_load_i32(&cached);
+    if (v >= 0) return v;
+    xc_cpu_init_once();
+    v = (__builtin_cpu_supports("avx512f") &&
+         __builtin_cpu_supports("avx512ifma") &&
+         __builtin_cpu_supports("avx512dq") &&
+         __builtin_cpu_supports("avx512vl") &&
+         __builtin_cpu_supports("fma")) ? 1 : 0;
+    xc_atomic_store_i32(&cached, v);
+    return v;
 }
 
 XC_TARGET_IFMA52 static inline __m512d pi_exact_inv_pd(__m512d d) {

@@ -1,11 +1,12 @@
 """
 x-cruncher Python Bindings (zero third-party dependencies, pure ctypes).
 
-Accelerates arbitrary-precision Python `int` multiplication via:
+Accelerates arbitrary-precision Python `int` multiplication & zero-storage Pi extraction via:
   - Register/L1 raw 64-bit schoolbook & Karatsuba
   - Vedic Signed Power-of-2 (NAF) sparse polynomial solver
-  - Crandall-Fagin Right-Angle 16-bit Carry-Free Vedic Vinculum Wave Engine
-  - Precomputed Static WaveTrunks & 64-Bit Block-Hash Wave Collapse
+  - 51-Bit Table-Free Lazy Harvey 2-Prime AVX-512 IFMA52 + VBMI Four-Step Radix-4 NTT
+  - Crandall-Fagin Right-Angle Adaptive 10..16-bit Carry-Free Vedic Vinculum Wave Engine
+  - Precomputed Static Trunks (`WaveTrunk`) & Zero-Storage Huvent Hexadecimal Pi Extractor
 """
 
 from __future__ import annotations
@@ -15,12 +16,16 @@ import os
 import platform
 import shutil
 import subprocess
+import tempfile
+import threading
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 _LIB: Optional[ctypes.CDLL] = None
+_LIB_LOCK = threading.Lock()
+_MAX_PI_HEX_OFFSET = 1 << 44
 
 
 def _load_cdll(path: Path) -> ctypes.CDLL:
@@ -35,62 +40,88 @@ def _load_cdll(path: Path) -> ctypes.CDLL:
     return _bind_signatures(ctypes.CDLL(str(path)))
 
 
+def _user_cache_dir() -> Path:
+    if platform.system() == "Windows":
+        base = Path(os.environ.get("LOCALAPPDATA") or tempfile.gettempdir())
+    else:
+        base = Path(os.environ.get("XDG_CACHE_HOME") or (Path.home() / ".cache"))
+    d = base / "xcruncher" / f"v{__version__}-{platform.machine()}"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _find_or_build_lib() -> ctypes.CDLL:
     global _LIB
     if _LIB is not None:
         return _LIB
 
-    sys_name = platform.system()
-    if sys_name == "Windows":
-        names = ["xcruncher.dll", "libxcruncher.dll"]
-    elif sys_name == "Darwin":
-        names = ["libxcruncher.dylib", "xcruncher.dylib"]
-    else:
-        names = ["libxcruncher.so", "xcruncher.so"]
-
-    pkg_dir = Path(__file__).resolve().parent
-    repo_root = pkg_dir.parent.parent
-    search_dirs = [
-        pkg_dir,
-        repo_root,
-        repo_root / "build",
-        repo_root / "build" / "Release",
-    ]
-    env_lib = os.environ.get("XCRUNCHER_LIB_PATH")
-    if env_lib and Path(env_lib).is_file():
-        _LIB = _load_cdll(Path(env_lib))
-        return _LIB
-
-    for d in search_dirs:
-        for name in names:
-            cand = d / name
-            if cand.is_file():
-                _LIB = _load_cdll(cand)
-                return _LIB
-
-    # Auto-build from C source if running from a source checkout
-    c_src = repo_root / "src" / "xcruncher.c"
-    if c_src.is_file():
-        out_lib = pkg_dir / names[0]
-        cc = shutil.which("gcc") or shutil.which("clang")
-        if cc:
-            cmd = [cc, "-O3", "-shared", str(c_src), "-I", str(repo_root / "include"), "-o", str(out_lib)]
-            if sys_name == "Windows":
-                cmd.extend(["-DXCRUNCHER_BUILD_DLL", "-static"])
-            else:
-                cmd.insert(3, "-fPIC")
-                cmd.append("-lm")
-            try:
-                subprocess.run(cmd + ["-fopenmp"], check=True, capture_output=True)
-            except subprocess.CalledProcessError:
-                subprocess.run(cmd, check=True, capture_output=True)
-            _LIB = _load_cdll(out_lib)
+    with _LIB_LOCK:
+        if _LIB is not None:
             return _LIB
 
-    raise RuntimeError(
-        "Could not locate or build xcruncher shared library. "
-        "Build with `make` or `cmake -B build && cmake --build build --config Release`."
-    )
+        sys_name = platform.system()
+        if sys_name == "Windows":
+            names = ["xcruncher.dll", "libxcruncher.dll"]
+        elif sys_name == "Darwin":
+            names = ["libxcruncher.dylib", "xcruncher.dylib"]
+        else:
+            names = ["libxcruncher.so", "xcruncher.so"]
+
+        env_lib = os.environ.get("XCRUNCHER_LIB_PATH")
+        if env_lib and Path(env_lib).is_file():
+            _LIB = _load_cdll(Path(env_lib))
+            return _LIB
+
+        pkg_dir = Path(__file__).resolve().parent
+        repo_root = pkg_dir.parent.parent
+        search_dirs = [
+            pkg_dir,
+            repo_root,
+            repo_root / "build",
+            repo_root / "build" / "Release",
+        ]
+        try:
+            search_dirs.append(_user_cache_dir())
+        except OSError:
+            pass
+
+        for d in search_dirs:
+            for name in names:
+                cand = d / name
+                if cand.is_file():
+                    _LIB = _load_cdll(cand)
+                    return _LIB
+
+        # Fallback auto-build from bundled `xcruncher/_csrc/` or repository `src/`
+        source_pairs = [
+            (pkg_dir / "_csrc" / "xcruncher.c", pkg_dir / "_csrc"),
+            (repo_root / "src" / "xcruncher.c", repo_root / "include"),
+        ]
+        for c_src, inc_dir in source_pairs:
+            if not c_src.is_file():
+                continue
+            out_dir = pkg_dir if os.access(pkg_dir, os.W_OK) else _user_cache_dir()
+            out_lib = out_dir / names[0]
+            cc = os.environ.get("CC") or shutil.which("gcc") or shutil.which("clang") or shutil.which("cc")
+            if cc:
+                shared_flag = "-dynamiclib" if sys_name == "Darwin" else "-shared"
+                cmd = [cc, "-O3", "-std=c11", shared_flag, str(c_src), "-I", str(inc_dir), "-o", str(out_lib)]
+                if sys_name == "Windows":
+                    cmd.extend(["-DXCRUNCHER_BUILD_DLL", "-static"])
+                else:
+                    cmd.insert(4, "-fPIC")
+                    cmd.append("-lm")
+                try:
+                    subprocess.run(cmd + ["-fopenmp"], check=True, capture_output=True)
+                except subprocess.CalledProcessError:
+                    subprocess.run(cmd, check=True, capture_output=True)
+                _LIB = _load_cdll(out_lib)
+                return _LIB
+
+        raise RuntimeError(
+            "Could not locate or build xcruncher shared library. "
+            "Install a platform wheel (`pip install x-cruncher`) or build with `make` / `cmake`."
+        )
 
 
 def _bind_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
@@ -248,9 +279,9 @@ class WaveTrunk:
 
 
 def pi_hex(hex_offset: int, digits: int = 16) -> str:
-    """Extract `digits` (1..20) exact hexadecimal digits of Pi after 16^(-hex_offset) with zero storage."""
-    if hex_offset < 0 or not (1 <= digits <= 20):
-        raise ValueError("hex_offset must be >= 0 and digits must be in 1..20")
+    """Extract `digits` (1..20) exact hexadecimal digits of Pi after 16^(-hex_offset) for 0 <= hex_offset <= 2^44."""
+    if not (0 <= hex_offset <= _MAX_PI_HEX_OFFSET) or not (1 <= digits <= 20):
+        raise ValueError(f"hex_offset must be in 0..{_MAX_PI_HEX_OFFSET} (2^44) and digits must be in 1..20")
     lib = _find_or_build_lib()
     buf = ctypes.create_string_buffer(digits + 1)
     rc = lib.xc_pi_hex_digits(ctypes.c_uint64(hex_offset), buf, ctypes.c_size_t(digits))

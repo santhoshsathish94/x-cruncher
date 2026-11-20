@@ -14,6 +14,9 @@
 #if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
   #define _CRT_SECURE_NO_WARNINGS
 #endif
+#if !defined(_WIN32) && !defined(_FILE_OFFSET_BITS)
+  #define _FILE_OFFSET_BITS 64
+#endif
 #if defined(__linux__) && !defined(_GNU_SOURCE)
   #define _GNU_SOURCE
 #endif
@@ -22,6 +25,8 @@
 #endif
 
 #include "xcruncher.h"
+#include <errno.h>
+#include <limits.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -93,6 +98,7 @@ static gmp_mul_fn load_gmp_mul(void) {
 }
 
 static uint64_t *alloc_u64(size_t n) {
+    if (n == 0 || n > SIZE_MAX / sizeof(uint64_t)) return NULL;
     return (uint64_t *)malloc(n * sizeof(uint64_t));
 }
 
@@ -100,20 +106,45 @@ static void free_u64(uint64_t *p) {
     free(p);
 }
 
+static int file_size_i64(FILE *f, int64_t *out_sz) {
+#if defined(_WIN32)
+    if (_fseeki64(f, 0, SEEK_END) != 0) return -1;
+    int64_t sz = _ftelli64(f);
+    if (sz < 0 || _fseeki64(f, 0, SEEK_SET) != 0) return -1;
+    *out_sz = sz;
+    return 0;
+#else
+    if (fseeko(f, 0, SEEK_END) != 0) return -1;
+    off_t sz = ftello(f);
+    if (sz < 0 || fseeko(f, 0, SEEK_SET) != 0) return -1;
+    *out_sz = (int64_t)sz;
+    return 0;
+#endif
+}
+
 static uint64_t *read_limb_file(const char *path, size_t *out_n) {
     FILE *f = fopen(path, "rb");
     if (!f) { perror(path); return NULL; }
-    if (fseek(f, 0, SEEK_END) != 0) { fclose(f); return NULL; }
-    long sz = ftell(f);
-    if (sz <= 0 || (sz % 8) != 0) {
-        fprintf(stderr, "Error: %s size (%ld bytes) must be a positive multiple of 8.\n", path, sz);
+    int64_t sz = 0;
+    if (file_size_i64(f, &sz) != 0 || sz <= 0 || (sz % 8) != 0) {
+        fprintf(stderr, "Error: %s size (%lld bytes) must be a positive multiple of 8.\n",
+                path, (long long)sz);
         fclose(f);
         return NULL;
     }
-    rewind(f);
-    size_t n = (size_t)sz / 8ULL;
+    uint64_t n64 = (uint64_t)sz / 8ULL;
+    if (n64 > (uint64_t)(SIZE_MAX / sizeof(uint64_t))) {
+        fprintf(stderr, "Error: %s exceeds addressable size_t limb limit.\n", path);
+        fclose(f);
+        return NULL;
+    }
+    size_t n = (size_t)n64;
     uint64_t *buf = alloc_u64(n);
-    if (!buf) { fclose(f); return NULL; }
+    if (!buf) {
+        fprintf(stderr, "Error: out of memory allocating %zu limbs for %s\n", n, path);
+        fclose(f);
+        return NULL;
+    }
     if (fread(buf, 8, n, f) != n) {
         fprintf(stderr, "Error: short read on %s\n", path);
         free_u64(buf);
@@ -123,6 +154,16 @@ static uint64_t *read_limb_file(const char *path, size_t *out_n) {
     fclose(f);
     *out_n = n;
     return buf;
+}
+
+static int parse_positive_runs(const char *arg, int *out_runs) {
+    if (!arg || arg[0] == '\0') return 0;
+    errno = 0;
+    char *endp = NULL;
+    long v = strtol(arg, &endp, 10);
+    if (errno != 0 || endp == arg || *endp != '\0' || v < 1L || v > 100000L) return 0;
+    *out_runs = (int)v;
+    return 1;
 }
 
 static int cmp_double(const void *p1, const void *p2) {
@@ -146,48 +187,61 @@ int main(int argc, char **argv) {
         if (strcmp(argv[i], "--synthetic-100m") == 0) synthetic_100m = 1;
         else if (strcmp(argv[i], "--distinct") == 0) distinct = 1;
         else if (strcmp(argv[i], "--verify-gmp") == 0) verify_gmp = 1;
-        else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) runs = atoi(argv[++i]);
-        else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
+        else if (strcmp(argv[i], "--runs") == 0 && i + 1 < argc) {
+            if (!parse_positive_runs(argv[++i], &runs)) {
+                fprintf(stderr, "Error: --runs expects an integer in 1..100000 (got '%s')\n", argv[i]);
+                return 1;
+            }
+        } else if (strcmp(argv[i], "-o") == 0 && i + 1 < argc) out_path = argv[++i];
         else if (argv[i][0] == '-') { usage(argv[0]); return 1; }
         else if (!file_a) file_a = argv[i];
         else if (!file_b) file_b = argv[i];
         else { usage(argv[0]); return 1; }
     }
-    if (runs < 1) runs = 1;
     if (!synthetic_100m && !file_a) { usage(argv[0]); return 1; }
 
-    size_t na = 0, nb = 0;
-    uint64_t *a = NULL, *b = NULL;
+    int exit_code = 1;
+    size_t na = 0, nb = 0, n_out = 0;
+    uint64_t *a = NULL, *b = NULL, *out = NULL, *ref = NULL;
+    double *times = NULL;
+
     if (synthetic_100m) {
         na = 5190513ULL; /* floor(10^100000000) scale = 5,190,513 uint64_t limbs */
         nb = na;
         a = alloc_u64(na);
-        if (!a) return 1;
+        if (!a) goto cleanup;
         uint64_t s = 0x3141592653589793ULL;
         for (size_t i = 0; i < na; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; a[i] = s; }
         if (distinct) {
             b = alloc_u64(nb);
-            if (!b) { free_u64(a); return 1; }
+            if (!b) goto cleanup;
             for (size_t i = 0; i < nb; i++) { s ^= s << 13; s ^= s >> 7; s ^= s << 17; b[i] = s; }
         } else {
             b = a;
         }
     } else {
         a = read_limb_file(file_a, &na);
-        if (!a) return 1;
+        if (!a) goto cleanup;
         if (file_b) {
             b = read_limb_file(file_b, &nb);
-            if (!b) { free_u64(a); return 1; }
+            if (!b) goto cleanup;
         } else {
             b = a;
             nb = na;
         }
     }
 
-    size_t n_out = na + nb;
-    uint64_t *out = alloc_u64(n_out);
-    double *times = (double *)malloc((size_t)runs * sizeof(double));
-    if (!out || !times) return 1;
+    if (na > SIZE_MAX - nb) {
+        fprintf(stderr, "Error: na + nb overflows size_t.\n");
+        goto cleanup;
+    }
+    n_out = na + nb;
+    out = alloc_u64(n_out);
+    times = (double *)malloc((size_t)runs * sizeof(double));
+    if (!out || !times) {
+        fprintf(stderr, "Error: out of memory allocating output/timing buffers.\n");
+        goto cleanup;
+    }
 
     int omp_max = 1;
 #ifdef _OPENMP
@@ -208,7 +262,8 @@ int main(int argc, char **argv) {
         double dt = now_ms() - t0;
         if (rc != XC_OK) {
             fprintf(stderr, "xc_mul_u64 failed with code %d\n", rc);
-            return 2;
+            exit_code = 2;
+            goto cleanup;
         }
         times[r] = dt;
         printf("  Run %2d : %9.3f ms\n", r + 1, dt);
@@ -236,20 +291,25 @@ int main(int argc, char **argv) {
         if (!fo || fwrite(out, 8, n_out, fo) != n_out) {
             perror(out_path);
             if (fo) fclose(fo);
-            return 3;
+            exit_code = 3;
+            goto cleanup;
         }
         fclose(fo);
         printf("  Output : wrote %zu limbs to %s\n", n_out, out_path);
     }
 
-    int exit_code = 0;
+    exit_code = 0;
     if (verify_gmp) {
         gmp_mul_fn gmp_mul = load_gmp_mul();
         if (!gmp_mul) {
             fprintf(stderr, "  GMP    : libgmp not found on dynamic library path (skipped)\n");
         } else {
-            uint64_t *ref = alloc_u64(n_out);
-            if (!ref) return 1;
+            ref = alloc_u64(n_out);
+            if (!ref) {
+                fprintf(stderr, "Error: out of memory allocating GMP reference buffer.\n");
+                exit_code = 1;
+                goto cleanup;
+            }
             double tg0 = now_ms();
             if (na >= nb) gmp_mul(ref, a, (intptr_t)na, b, (intptr_t)nb);
             else          gmp_mul(ref, b, (intptr_t)nb, a, (intptr_t)na);
@@ -258,11 +318,12 @@ int main(int argc, char **argv) {
             printf("  GMP 1T : %9.3f ms | Exact bit-for-bit match: %s\n",
                    tg, exact ? "YES (100%)" : "NO (MISMATCH!)");
             if (!exact) exit_code = 4;
-            free_u64(ref);
         }
     }
     printf("========================================================================\n");
 
+cleanup:
+    free_u64(ref);
     free(times);
     free_u64(out);
     if (b && b != a) free_u64(b);

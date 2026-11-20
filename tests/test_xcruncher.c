@@ -8,6 +8,12 @@
 #include <stdlib.h>
 #include <string.h>
 
+#if defined(_WIN32)
+  #include <windows.h>
+#else
+  #include <pthread.h>
+#endif
+
 static int g_pass = 0;
 static int g_fail = 0;
 
@@ -46,6 +52,57 @@ static void ref_mul(uint64_t *out, const uint64_t *a, size_t na, const uint64_t 
         }
         out[i + nb] += carry;
     }
+}
+
+typedef struct {
+    int      tid;
+    size_t   n;
+    const uint64_t *a;
+    const uint64_t *b;
+    const uint64_t *exp;
+    int      ok;
+} mt_worker_arg_t;
+
+#if defined(_WIN32)
+static DWORD WINAPI mt_worker_fn(LPVOID p)
+#else
+static void *mt_worker_fn(void *p)
+#endif
+{
+    mt_worker_arg_t *w = (mt_worker_arg_t *)p;
+    uint64_t *out = (uint64_t *)malloc(2 * w->n * sizeof(uint64_t));
+    int ok = (out != NULL);
+    for (int iter = 0; iter < 4 && ok; iter++) {
+        /* Alternate between large cached Wave/NTT multiply and tiny Schoolbook multiply
+           on concurrent threads to verify thread-local xc_last_path_used() isolation! */
+        if ((iter + w->tid) & 1) {
+            int rc = xc_mul_u64(out, w->a, w->n, w->b, w->n);
+            xc_path_t path = xc_last_path_used();
+            if (rc != XC_OK || path != XC_PATH_WAVE_COLD ||
+                memcmp(out, w->exp, 2 * w->n * sizeof(uint64_t)) != 0) ok = 0;
+        } else {
+            uint64_t sa[4] = {3ULL + (uint64_t)w->tid, 7ULL, 11ULL, 13ULL};
+            uint64_t sb[4] = {17ULL, 19ULL, 23ULL, 29ULL};
+            uint64_t so[8], se[8];
+            ref_mul(se, sa, 4, sb, 4);
+            int rc = xc_mul_u64(so, sa, 4, sb, 4);
+            xc_path_t path = xc_last_path_used();
+            if (rc != XC_OK || path != XC_PATH_SCHOOLBOOK ||
+                memcmp(so, se, sizeof(se)) != 0) ok = 0;
+        }
+        const char *isa = xc_active_isa_name();
+        if (!isa || isa[0] == '\0') ok = 0;
+    }
+    char hex[24] = {0};
+    if (xc_pi_hex_digits(0ULL, hex, 20) != XC_OK ||
+        strcmp(hex, "243f6a8885a308d31319") != 0) ok = 0;
+    free(out);
+    w->ok = ok;
+#if defined(_WIN32)
+    return 0;
+#else
+    return NULL;
+#endif
 }
 
 int main(void) {
@@ -262,9 +319,41 @@ int main(void) {
         char h0[24] = {0}, h1m[24] = {0};
         int r0 = xc_pi_hex_digits(0ULL,       h0,  20);
         int r1 = xc_pi_hex_digits(1000000ULL, h1m, 20);
+        int r_oob = xc_pi_hex_digits((1ULL << 44) + 1ULL, h0, 20);
         CHECK(r0 == XC_OK && strcmp(h0,  "243f6a8885a308d31319") == 0 &&
-              r1 == XC_OK && strcmp(h1m, "6c65e52cb459350050e4") == 0,
-              "Zero-storage Pi hex digit extraction (20/20 hex digits at offset 0 & 1,000,000) exact");
+              r1 == XC_OK && strcmp(h1m, "6c65e52cb459350050e4") == 0 &&
+              r_oob == XC_ERR_ARG,
+              "Zero-storage Pi hex digit extraction (offset 0, 1M & >2^44 range guard) exact");
+    }
+
+    /* 9. Concurrent Multi-Thread Callers + Thread-Local Diagnostics + Shared Cache Safety */
+    {
+        const size_t n = 1200;
+        uint64_t *a = (uint64_t *)malloc(n * 8), *b = (uint64_t *)malloc(n * 8);
+        uint64_t *exp = (uint64_t *)malloc(2 * n * 8);
+        for (size_t i = 0; i < n; i++) { a[i] = xorshift64(&rng); b[i] = xorshift64(&rng); }
+        ref_mul(exp, a, n, b, n);
+
+        mt_worker_arg_t args[4];
+#if defined(_WIN32)
+        HANDLE th[4];
+        for (int t = 0; t < 4; t++) {
+            args[t].tid = t; args[t].n = n; args[t].a = a; args[t].b = b; args[t].exp = exp; args[t].ok = 0;
+            th[t] = CreateThread(NULL, 0, mt_worker_fn, &args[t], 0, NULL);
+        }
+        WaitForMultipleObjects(4, th, TRUE, INFINITE);
+        for (int t = 0; t < 4; t++) CloseHandle(th[t]);
+#else
+        pthread_t th[4];
+        for (int t = 0; t < 4; t++) {
+            args[t].tid = t; args[t].n = n; args[t].a = a; args[t].b = b; args[t].exp = exp; args[t].ok = 0;
+            pthread_create(&th[t], NULL, mt_worker_fn, &args[t]);
+        }
+        for (int t = 0; t < 4; t++) pthread_join(th[t], NULL);
+#endif
+        int all_ok = args[0].ok && args[1].ok && args[2].ok && args[3].ok;
+        free(a); free(b); free(exp);
+        CHECK(all_ok, "Concurrent multi-thread callers + thread-local diagnostics race-free & exact");
     }
 
     printf("========================================================================\n");

@@ -29,8 +29,27 @@ jobs:
       - name: Run C Exactness Suite
         run: ctest --test-dir build --output-on-failure -C Release
 
-      - name: Run Python Bindings Suite
+      - name: Run Python Bindings Suite (Checkout)
         run: python tests/test_python.py
+
+      - name: Build & Verify Standalone Python Wheel in Clean-Room Venv
+        shell: bash
+        run: |
+          python -m pip install --upgrade pip build wheel setuptools
+          python -m build --wheel --outdir dist
+          CLEAN_DIR="${RUNNER_TEMP}/xc_clean_check"
+          rm -rf "${CLEAN_DIR}" && mkdir -p "${CLEAN_DIR}"
+          python -m venv "${CLEAN_DIR}/venv"
+          if [ -x "${CLEAN_DIR}/venv/bin/python" ]; then
+            VP="${CLEAN_DIR}/venv/bin/python"
+          else
+            VP="${CLEAN_DIR}/venv/Scripts/python.exe"
+          fi
+          "${VP}" -m pip install dist/*.whl
+          cp tests/test_python.py "${CLEAN_DIR}/test_python.py"
+          cd "${CLEAN_DIR}"
+          "${VP}" test_python.py
+          "${VP}" -c "import pathlib, xcruncher as xc; p = pathlib.Path(xc.__file__).resolve(); assert 'xc_clean_check' in str(p), p; assert xc.active_isa(); assert xc.pi_hex(1_000_000, 20) == '6c65e52cb459350050e4'; a, b = (1 << 20000) - 17, (1 << 19999) - 29; assert xc.mul(a, b) == a * b; print('Clean-room wheel verified:', p, '| ISA:', xc.active_isa())"
 
   sanitizers:
     runs-on: ubuntu-latest
@@ -44,9 +63,14 @@ jobs:
 
       - name: Run AddressSanitizer + UBSan on GCC 13, GCC 14, and Clang (AVX-512 / AVX2 / Scalar)
         run: |
-          gcc -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc13
+          gcc -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -pthread -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc13
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_gcc13
-          gcc-14 -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc14
+          gcc-14 -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -pthread -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc14
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_gcc14
-          clang -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_clang
+          clang -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -pthread -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_clang
           ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_clang
+
+      - name: Run ThreadSanitizer Concurrency Check (Multi-Thread Callers + Thread-Local Diagnostics)
+        run: |
+          clang -O2 -g -Wall -Wextra -Werror -Wno-unknown-pragmas -Wno-unused-variable -fsanitize=thread -pthread -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_tsan
+          TSAN_OPTIONS=halt_on_error=1:second_deadlock_stack=1 setarch $(uname -m) -R ./test_tsan

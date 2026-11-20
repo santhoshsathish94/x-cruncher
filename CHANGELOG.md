@@ -2,6 +2,17 @@
 
 All notable changes to `x-cruncher` are documented in this file.
 
+## [1.6.1] - 2026-11-20
+
+### Fixed
+- **Standalone Python Wheel & Source Distribution Packaging:** Added `setup.py` and `MANIFEST.in` so platform wheels (`py3-none-linux_x86_64`, `py3-none-win_amd64`, `py3-none-macosx_*`) pre-compile and bundle the native shared library (`libxcruncher.so` / `xcruncher.dll` / `libxcruncher.dylib`), while `sdist` (`x_cruncher-*.tar.gz`) includes `src/xcruncher.c`, `include/xcruncher.h`, and `_csrc/` with writable user-cache fallback compilation and clean-room virtualenv verification in CI.
+- **Thread-Local Diagnostics & Atomic Lazy Initialization (`ThreadSanitizer` Clean):** Made `g_last_path`, `g_last_uniq`, and `g_last_bits` thread-local (`XC_THREAD_LOCAL`), guarded `__builtin_cpu_init()` with an atomic once-latch (`xc_cpu_init_once`), converted all lazy static ISA/topology caches to acquire/release atomics, added thread-safety locking in Python `_find_or_build_lib()`, and documented `xc_plan_t` vs `xc_mul_u64` concurrency rules.
+- **Documentation & Metadata Consistency:** Corrected the documented `xc_pi_hex_digits` offset bound to match the actual implementation guard (`0 <= hex_offset <= 2^44`, $\approx 1.76 \times 10^{13}$), updated stale `v1.3.0`/`v1.4.0` tables in `README.md`, and synchronized `include/xcruncher.h` and `pyproject.toml` descriptions with the 51-bit NTT architecture.
+- **`bench/repro_raw_limbs.c` Hardening:** Added 64-bit file offset I/O (`_fseeki64`/`_ftelli64` on Windows, `fseeko`/`ftello` with `_FILE_OFFSET_BITS=64` on POSIX), `SIZE_MAX` integer overflow checks on limb counts, strict `strtol` `--runs` validation, and leak-free cleanup on error paths.
+- **CI & Release Workflow Hardening:** Added clean-room wheel + `sdist` installation tests outside the repo directory across Linux, Windows, and macOS, `ThreadSanitizer` concurrency testing, and dynamic tag-driven release notes in `.github/workflows/release.yml`.
+
+---
+
 ## [1.6.0] - 2026-11-20
 
 ### Added

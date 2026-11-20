@@ -3,12 +3,15 @@
  * Copyright (c) 2026 Santhosh Narayanan. Released under the MIT License.
  *
  * Combines:
- *   1. Register-scale raw 64-bit / Karatsuba limb multiplication (<= ~5,000 digits)
+ *   1. Register-scale raw 64-bit / Karatsuba limb multiplication (<= ~7,400 digits)
  *   2. Vedic Signed Power-of-2 (NAF) sparse polynomial fast-path (near-2^k / sparse runs)
- *   3. Crandall-Fagin Right-Angle (Y^M + i = 0) 16-bit Carry-Free Vedic Vinculum
- *      640 x 2^k Four-Step Wave Engine with < 256 KB Coarse x Fine Angle LUTs,
- *      L1-conflict-free AoSoA8 / AoSoA4 layout, Precomputed WaveTrunks, and
- *      On-The-Fly 64-bit Block-Hash Wave Collapse (AVX-512 / AVX2 / Portable Scalar).
+ *   3. 51-Bit Table-Free Lazy Harvey [0, 2P) 2-Prime AVX-512 IFMA52 + VBMI Four-Step
+ *      Radix-4 Exact Integer NTT (~400K .. 101M digits per operand) with 4-cursor fused
+ *      Four-Step twiddles, Carry-Free 40-bit Vedic Vinculum limbs, and signed 102-bit Garner CRT
+ *   4. Crandall-Fagin Right-Angle (Y^M + i = 0) Adaptive 10..16-bit Carry-Free Vedic Vinculum
+ *      Four-Step Wave Engine with provable worst-case IEEE-754 bounds, Precomputed WaveTrunks,
+ *      64-bit Block-Hash Wave Collapse, and 50%-RAM Raw-Bit Karatsuba Top-Split
+ *      (AVX-512 / AVX2+FMA / ARM64 NEON / Portable Scalar).
  */
 
 #ifndef XCRUNCHER_H
@@ -35,7 +38,7 @@ extern "C" {
   #define XC_API
 #endif
 
-#define XCRUNCHER_VERSION "1.6.0"
+#define XCRUNCHER_VERSION "1.6.1"
 
 /* Error / status codes */
 #define XC_OK          0
@@ -67,24 +70,32 @@ typedef struct xc_trunk_s xc_trunk_t;
  * Automatically selects the fastest exact mathematical path:
  *   - Raw 64x64->128 schoolbook / Karatsuba for register/L1 sizes
  *   - Vedic Signed Power-of-2 (NAF) sparse polynomial solver for near-2^k / long 0-or-1 runs
- *   - Crandall-Fagin 16-bit Carry-Free Vedic Vinculum Four-Step Wave Engine for huge inputs
+ *   - 2-Prime 51-bit Lazy Harvey AVX-512 IFMA52 + VBMI NTT (~400K .. 101M digits/operand)
+ *   - Adaptive 10..16-bit Crandall-Fagin Vedic Wave Engine & Low-RAM Karatsuba Top-Split
+ *
+ * Thread safety: `xc_mul_u64` and `xc_mul_u64_lowmem` are safe to call concurrently from
+ * multiple application threads (assuming distinct `out` buffers).
  */
 XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
                       const uint64_t *b, size_t nb);
 
 /*
  * Low-RAM Raw-Bit Karatsuba Top-Split Multiply:
- * Splits raw uint64_t arrays in half BEFORE wave expansion, cutting peak wave memory by 50%.
+ * Splits raw uint64_t arrays in half BEFORE wave/NTT expansion, cutting peak workspace RAM by 50%.
  */
 XC_API int xc_mul_u64_lowmem(uint64_t *out, const uint64_t *a, size_t na,
                              const uint64_t *b, size_t nb);
 
 /*
- * Reusable Wave Plan & Precomputed Static WaveTrunk API:
- *   - `xc_plan_create(max_na, max_nb)` allocates reusable HugePage wave workspaces once.
- *   - `xc_trunk_create(plan, b, nb)` pre-transforms constant multiplier `B` into `WaveTrunk(B)`.
- *   - `xc_mul_trunk(plan, out, a, na, trunk)` multiplies fresh `A` by `WaveTrunk(B)`,
- *     automatically engaging 64-bit Block-Hash Wave Collapse when `A` has repeated slices.
+ * Reusable Plan & Precomputed Static Trunk API:
+ *   - `xc_plan_create(max_na, max_nb)` allocates reusable NTT or Wave workspaces once.
+ *   - `xc_trunk_create(plan, b, nb)` pre-transforms constant multiplier `B` into `Trunk(B)`.
+ *   - `xc_mul_trunk(plan, out, a, na, trunk)` multiplies fresh `A` by `Trunk(B)`.
+ *
+ * Thread safety: A single `xc_plan_t` holds mutable workspace buffers and MUST NOT be used
+ * concurrently by multiple threads at the same time (create one `xc_plan_t` per caller thread).
+ * An immutable `const xc_trunk_t *` may be shared read-only across threads that each use their
+ * own compatible `xc_plan_t`.
  */
 XC_API xc_plan_t  *xc_plan_create(size_t max_na, size_t max_nb);
 XC_API void        xc_plan_destroy(xc_plan_t *plan);
@@ -109,15 +120,17 @@ XC_API char *xc_mul_decimal(const char *dec_a, const char *dec_b);
 XC_API void  xc_free(void *ptr);
 
 /*
- * Zero-Storage N-th Hexadecimal Digit Extractor for Pi (Fused 8-Series Huvent + Seiler IFMA52):
+ * Zero-Storage N-th Hexadecimal Digit Extractor for Pi (Fused 8-Series Huvent BBP):
  *   Computes `num_digits` (1 .. 20) exact hexadecimal digits of Pi starting after 16^(-hex_offset)
- *   using < 1 KB RAM and 0 bytes of disk storage (`hex_offset = 0` -> "243f6a8885a308d31319").
- *   Outperforms y-cruncher v0.8.7 `bench-bbp` at both 100M (61.9 ms vs 75.0 ms) and 1B (705.6 ms vs 724.0 ms).
+ *   for `0 <= hex_offset <= 2^44` (17,592,186,044,416, ~1.76e13) using < 1 KB RAM and 0 disk
+ *   (`hex_offset = 0` -> "243f6a8885a308d31319"). Thread-safe for concurrent callers.
  */
 XC_API int xc_pi_hex_digits(uint64_t hex_offset, char *out_hex, size_t num_digits);
 
 /*
- * Runtime Hardware & Diagnostics
+ * Runtime Hardware & Per-Thread Diagnostics:
+ *   `xc_last_path_used`, `xc_last_unique_slices`, and `xc_last_limb_bits` report thread-local
+ *   diagnostics for the most recent multiplication executed on the calling thread.
  */
 XC_API const char *xc_version(void);
 XC_API const char *xc_active_isa_name(void);
