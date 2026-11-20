@@ -235,8 +235,18 @@ int main(void) {
         int ok_sq_l1 = (memcmp(gl, el, 2 * n_l * 8) == 0);
         xc_mul_u64(gl, al, n_l, al, n_l);
         int ok_sq_l2 = (memcmp(gl, el, 2 * n_l * 8) == 0);
+        /* Also test maximal negative (-2^39) and positive (+2^39-1) 40-bit signed CRT extremes! */
+        uint8_t *ab = (uint8_t *)al, *bb = (uint8_t *)al2;
+        for (size_t idx = 0; (idx + 1) * 5 <= n_l * 8; idx++) {
+            ab[idx*5+0]=0xFF; ab[idx*5+1]=0xFF; ab[idx*5+2]=0xFF; ab[idx*5+3]=0xFF; ab[idx*5+4]=0x7F; /* +2^39 - 1 */
+            bb[idx*5+0]=0x00; bb[idx*5+1]=0x00; bb[idx*5+2]=0x00; bb[idx*5+3]=0x00; bb[idx*5+4]=0x80; /* -2^39     */
+        }
+        ref_mul(el, al, n_l, al2, n_l);
+        xc_mul_u64(gl, al, n_l, al2, n_l);
+        int ok_neg_crt = (memcmp(gl, el, 2 * n_l * 8) == 0);
         free(al); free(al2); free(gl); free(el);
-        CHECK(ok_sq_w && ok_sq_l1 && ok_sq_l2, "One-shot Squaring A * A fast-path (pointer-equal & value-equal, Wave + NTT) exact");
+        CHECK(ok_sq_w && ok_sq_l1 && ok_sq_l2 && ok_neg_crt,
+              "One-shot Squaring A * A & signed +/-2^39 40-bit Vedic CRT extremes exact");
     }
 
     /* 7. Decimal string multiplication */

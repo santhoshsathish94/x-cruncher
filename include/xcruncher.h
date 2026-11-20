@@ -35,7 +35,7 @@ extern "C" {
   #define XC_API
 #endif
 
-#define XCRUNCHER_VERSION "1.5.0"
+#define XCRUNCHER_VERSION "1.6.0"
 
 /* Error / status codes */
 #define XC_OK          0

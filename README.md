@@ -1,23 +1,23 @@
 # x-cruncher
 
-**`x-cruncher`** is a zero-dependency, **MIT-licensed** arbitrary-precision integer multiplication & zero-storage $\pi$ extraction engine in C11 (with zero-dependency Python `ctypes` bindings) that delivers **`13×–41×` multi-core speedups** (`up to 213×` on sparse near-$2^k$ inputs) over standard open-source libraries (`GNU GMP`, `FLINT`) **and outperforms closed-source `y-cruncher v0.8.7` (`22-ZN4 ~ Kizuna`) on both `100M × 100M` dense multiplication (`63.69 ms` Cold / `46.83 ms` Trunk / `41.18 ms` Square) and `100M` / `1B` zero-storage $\pi$ BBP extraction (`62.54 ms` vs `75.00 ms`)** — with **100% deterministic integer/worst-case exactness** on every possible input bit-pattern.
+**`x-cruncher`** is a zero-dependency, **MIT-licensed** arbitrary-precision integer multiplication & zero-storage $\pi$ extraction engine in C11 (with zero-dependency Python `ctypes` bindings) that delivers **`12×–45×` multi-core speedups** (`up to 274×` on sparse near-$2^k$ inputs) over standard open-source libraries (`GNU GMP`, `FLINT`) **and outperforms closed-source `y-cruncher v0.8.7` (`22-ZN4 ~ Kizuna`) on both `100M × 100M` dense multiplication (`59.83 ms` Cold / `44.32 ms` Trunk / `38.18 ms` Square on 16 cores; `140.38 ms` median vs `144.5 ms` on 4 Zen 4 threads) and `100M` / `1B` zero-storage $\pi$ BBP extraction (`62.04 ms` vs `75.00 ms`)** — with **100% deterministic integer/worst-case exactness** on every possible input bit-pattern.
 
 ---
 
 ## Verified Benchmarks (`AMD Ryzen 9 7950X3D`, 16 Physical Zen 4 Cores, DDR5)
 
-All timings below are produced directly by `./bench_xcruncher --100m` (`make bench-100m`, plain `-O3` with runtime `AVX-512 IFMA52` dispatch) in `v1.4.0`, and verified bit-for-bit (`memcmp == 0`) against `GNU GMP 6.3.0`'s `x86-64` assembly `__gmpn_mul_n` on **both** dense-random and pathological worst-case (`0xFFFFFFFF...` / `all +max` limb) inputs:
+All timings below are produced directly by `./bench_xcruncher --100m` (`make bench-100m`, plain `-O3` with runtime `AVX-512 IFMA52` dispatch) in `v1.6.0`, and verified bit-for-bit (`memcmp == 0`) against `GNU GMP 6.3.0`'s `x86-64` assembly `__gmpn_mul_n` on **both** dense-random and pathological worst-case (`0xFFFFFFFF...` / signed `±2^39` limb) inputs:
 
 | Input Size (Decimal Digits) | Active Exact Engine | `GNU GMP 6.3.0` (`__gmpn_mul_n`, 1T) | `x-cruncher` Cold `A * B` | `x-cruncher` Square `A * A` | `x-cruncher` `Trunk(B) * A` | `x-cruncher` Sparse (`NAF`) |
 | ---: | :---: | ---: | ---: | ---: | ---: | ---: |
-| **`1,024 × 1,024`** | `64-bit` Karatsuba | `0.01 ms` | **`0.0024 ms`** | **`0.0024 ms`** | — | **`< 0.001 ms`** |
-| **`100,000 × 100,000`** | `16-bit` ZMM Wave | `0.71 ms` | **`0.19 ms`** | **`0.21 ms`** | **`0.14 ms` (`5.1×`)** | **`0.01 ms` (`85×`)** |
-| **`1,000,000 × 1,000,000`** | `40-bit` `IFMA52` NTT | `9.55 ms` | **`0.71 ms` (`13.4×`)** | **`0.56 ms` (`17.1×`)** | **`0.50 ms` (`18.9×`)** | **`0.06 ms` (`161×`)** |
-| **`10,000,000 × 10,000,000`** | `40-bit` `IFMA52` NTT | `126.31 ms` | **`6.84 ms` (`18.5×`)** | **`4.43 ms` (`28.5×`)** | **`4.49 ms` (`28.2×`)** | **`0.79 ms` (`160×`)** |
-| **`100,000,000 × 100,000,000`** | `40-bit` `IFMA52` NTT | `1,703.21 ms` | **`63.69 ms` (`26.7×`)** | **`41.18 ms` (`41.4×`)** | **`46.83 ms` (`36.4×`)** | **`8.00 ms` (`213×`)** |
+| **`1,024 × 1,024`** | `64-bit` Karatsuba | `0.02 ms` | **`0.0024 ms`** | **`0.0024 ms`** | — | **`< 0.001 ms`** |
+| **`100,000 × 100,000`** | `16-bit` ZMM Wave | `0.78 ms` | **`0.18 ms` (`4.3×`)** | **`0.13 ms` (`6.1×`)** | **`0.13 ms` (`6.1×`)** | **`0.01 ms` (`94×`)** |
+| **`1,000,000 × 1,000,000`** | `51-bit` `IFMA52` NTT | `9.85 ms` | **`0.85 ms` (`11.6×`)** | **`0.59 ms` (`16.8×`)** | **`0.54 ms` (`18.1×`)** | **`0.08 ms` (`130×`)** |
+| **`10,000,000 × 10,000,000`** | `51-bit` `IFMA52` NTT | `133.57 ms` | **`5.02 ms` (`26.6×`)** | **`3.38 ms` (`39.5×`)** | **`3.85 ms` (`34.7×`)** | **`0.49 ms` (`274×`)** |
+| **`100,000,000 × 100,000,000`** | `51-bit` `IFMA52` NTT | `1,701.74 ms` | **`59.83 ms` (`28.4×`)** | **`38.18 ms` (`44.6×`)** | **`44.32 ms` (`38.4×`)** | **`6.38 ms` (`267×`)** |
 
 *Note on architecture, container/VM thread scaling, & exactness:*
-- **On `AVX-512 IFMA52` CPUs (`AMD Zen 4 / Zen 5`, `Intel Ice Lake+`):** Above `~400K` digits (`logN >= 17`), `x-cruncher v1.4.0` dispatches to a **Shoup–Seiler 2-Prime `52-bit` Four-Step Radix-4 Exact Integer NTT** ($P_1 = \text{0xffffe20000001}$, $P_2 = \text{0xffffe08000001}$, $P_1 P_2 \approx 2^{104}$) over unsigned `40-bit` (`5-byte`) limbs — eliminating `100%` of floating-point rounding on all inputs while shrinking `100M`-digit transform arrays from `671 MB` to **`134 MB`** (`4096 × 4096`, `32 KB` L1-resident rows) to hit **`63.69 ms` Cold / `46.83 ms` Trunk / `41.18 ms` One-Shot Square (`A * A`, `~450 MB` RSS)**!
+- **On `AVX-512 IFMA52` CPUs (`AMD Zen 4 / Zen 5`, `Intel Ice Lake+`):** Above `~400K` digits (`logN >= 17`, up to `~101M` digits per operand), `x-cruncher v1.6.0` dispatches to a **Table-Free Lazy Harvey `[0, 2P)` 2-Prime `51-bit` Four-Step Radix-4 Exact Integer NTT** ($P_1 = \text{0x7ffffa4000001}$, $P_2 = \text{0x7ffff90000001}$, $2P < 2^{52}$) over signed Carry-Free `40-bit` (`5-byte`) Vedic *Vinculum* limbs $d_m \in [-2^{39}, +2^{39}]$ — eliminating both floating-point rounding and butterfly `vpminuq` clamping instructions while fusing 4-cursor Four-Step twiddle stepping directly into the outer Radix-4 stages (**`59.83 ms` Cold / `44.32 ms` Trunk / `38.18 ms` One-Shot Square** on 16 cores; **`140.38 ms` median / `138.36 ms` best** on 4 Zen 4 threads, computing all **`200,000,000`** exact integer digits vs `y-cruncher`'s `144.5 ms` truncated `100M`-digit `BigFloat`).
 ### Multi-Device Portability (`Intel AVX2+FMA` Laptop & `Android 14 / ARM64 NEON`)
 
 Tested across desktop/server `AVX-512 IFMA52`, ultrabook `AVX2+FMA` (`13th Gen Intel Core i7-1355U`, 2P+8E hybrid cores on Windows 11 vs `GNU GMP 6.3.0` `libgmp-10.dll`), Apple Silicon `ARM64 NEON`, and **Android 14 (`NDK r27` `aarch64-linux-android29-clang -static-openmp`)**:
@@ -54,10 +54,10 @@ Using a **Single-Pass 8-Series-in-1-`ZMM` Fused Huvent Engine** (combining 3-cyc
 
 To make expectations completely clear for users and reviewers:
 
-### What `x-cruncher v1.3.0` Provides & Where It Leads
+### What `x-cruncher v1.6.0` Provides & Where It Leads
 - **Embeddable Open-Source Library (`MIT` C11 + Zero-Dependency Python):** Unlike `y-cruncher` (which is a closed-source standalone CLI executable), `x-cruncher` is a small, zero-dependency C11 shared/static library (`#include "xcruncher.h"`) and Python package (`import xcruncher`).
-- **In-RAM Big-Integer Multiplication (`uint64_t` limbs & Python `int`):** Beats single-threaded `GNU GMP 6.3.0` (`__gmpn_mul_n`) by **`12×–37×`** (`up to 206×` on sparse near-$2^k$ numbers) and outperforms `y-cruncher` on `AVX-512 IFMA52` CPUs (`Zen 4 / Zen 5`, `Ice Lake+`) at `1M`–`200M` digits (**`61.64 ms` Cold / `45.71 ms` `Trunk`** at `100M × 100M` digits).
-- **Zero-Storage $N$-th Hexadecimal $\pi$ Extraction (`xc_pi_hex_digits` / `xc.pi_hex`):** Jumps directly to any hexadecimal offset of $\pi$ using `< 1 KB` RAM and `0` disk storage, beating `y-cruncher v0.8.7`'s `bench-bbp` at `100M` (`61.94 ms` vs `75.00 ms`) and `1B` (`704.70 ms` vs `724.00 ms`) with `20/20` matching hex digits.
+- **In-RAM Big-Integer Multiplication (`uint64_t` limbs & Python `int`):** Beats single-threaded `GNU GMP 6.3.0` (`__gmpn_mul_n`) by **`12×–45×`** (`up to 274×` on sparse near-$2^k$ numbers) and outperforms `y-cruncher` on `AVX-512 IFMA52` CPUs (`Zen 4 / Zen 5`, `Ice Lake+`) up to `~101M` digits per operand (**`59.83 ms` Cold / `44.32 ms` `Trunk` / `38.18 ms` Square** on 16 cores; **`140.38 ms` median vs `144.5 ms`** on 4 Zen 4 threads — while returning the **full `200M`-digit exact integer product** rather than a truncated `100M`-digit floating-point approximation).
+- **Zero-Storage $N$-th Hexadecimal $\pi$ Extraction (`xc_pi_hex_digits` / `xc.pi_hex`):** Jumps directly to any hexadecimal offset of $\pi$ using `< 1 KB` RAM and `0` disk storage, beating `y-cruncher v0.8.7`'s `bench-bbp` at `100M` (`62.04 ms` vs `75.00 ms`) and `1B` (`703.50 ms` vs `724.00 ms`) with `20/20` matching hex digits.
 
 ### What `x-cruncher` Does *Not* Yet Implement (Where `y-cruncher` Remains Ahead)
 1. **Full All-Digits Decimal Constant Generation (`Chudnovsky` $\pi, e, \zeta(3), \gamma$):** `x-cruncher` extracts arbitrary *hexadecimal* slices of $\pi$ with zero storage (`xc_pi_hex_digits`), whereas computing *all* $N$ sequential *decimal* digits (`./y-cruncher bench 100m`) additionally requires Chudnovsky binary splitting, Newton–Raphson big-integer division/sqrt, and sub-quadratic divide-and-conquer radix conversion (`xc_from_decimal` / `xc_to_decimal` are $O(N^2)$ convenience helpers intended for small-to-medium strings; use binary `uint64_t` limbs or `xc.mul(int, int)` for million-digit numbers).
@@ -80,9 +80,9 @@ At magnitudes $\le 4.398 \times 10^{13}$, `1 ULP` of IEEE-754 `double` is at mos
 
 ## Core Mathematical & Systems Innovations
 
-1. **Shoup–Seiler 2-Prime `52-Bit` `AVX-512 IFMA52` Four-Step Radix-4 Exact Integer NTT (`400K`–`201M` Digits)**
-   - Uses two `52-bit` primes ($P_1 = \text{0xffffe20000001}$, $P_2 = \text{0xffffe08000001}$, $P_1 P_2 \approx 2^{104}$) over unsigned `40-bit` (`5-byte`) limbs — eliminating floating-point rounding completely while shrinking `100M`-digit matrices from `671 MB` to **`134 MB`** (`4096 × 4096`, `32 KB` L1-resident rows).
-   - Fuses 1-cycle `AVX-512 VBMI` (`vpermb`) `40-bit` unpacking, non-temporal `vmovntdq` column DIF writes, parallel Shoup `vpmadd52huq`/`vpmadd52luq` Radix-4 butterflies, register `IFMA52` Garner CRT, and direct `320-bit` (`5 × uint64_t`) output packing (`61.64 ms` Cold / `45.71 ms` `Trunk` at `100M` digits).
+1. **Table-Free Lazy Harvey `[0, 2P)` 2-Prime `51-Bit` `AVX-512 IFMA52` Four-Step Radix-4 Exact Integer NTT (`400K`–`101M` Digits)**
+   - Uses two `51-bit` primes ($P_1 = \text{0x7ffffa4000001}$, $P_2 = \text{0x7ffff90000001}$, $2P < 2^{52}$) over signed Carry-Free `40-bit` (`5-byte`) Vedic *Vinculum* limbs $d_m \in [-2^{39}, +2^{39}]$ — eliminating floating-point rounding and `100%` of Shoup butterfly `vpminuq` clamping instructions while shrinking `100M`-digit matrices from `671 MB` to **`134 MB`** (`4096 × 4096`, `32 KB` L1-resident rows).
+   - Fuses 1-cycle `AVX-512 VBMI` (`vpermb`) `40-bit` unpacking, 4-way parallel Four-Step register twiddle stepping fused directly into the outer Radix-4 stages (zero `134 MB` Four-Step twiddle tables), signed `102-bit` `IFMA52` Garner CRT, and direct `320-bit` (`5 × uint64_t`) output packing (`59.83 ms` Cold / `44.32 ms` `Trunk` / `38.18 ms` Square at `100M` digits).
 
 2. **Single-Pass 8-Series-in-1-`ZMM` Fused Huvent Zero-Storage $\pi$ Hex Extractor (`xc_pi_hex_digits`)**
    - Packs all 8 odd-denominator terms of Huvent's $2^{-12k}$ binary BBP formula into a single `ZMM` register with **identical base exponents** across all 8 lanes (zero mask divergence), switching from 3-cycle centered `double` FMA squaring ($m < 90\text{M}$) to `6×`-interleaved self-reducing Seiler `IFMA52` squaring ($m \ge 90\text{M}$) and `104-bit` (`20` hex digit) accumulation.

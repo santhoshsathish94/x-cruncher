@@ -348,7 +348,7 @@ XC_API const char *xc_version(void) { return XCRUNCHER_VERSION; }
 
 XC_API const char *xc_active_isa_name(void) {
     xc_isa_t isa = xc_detect_isa();
-    if (isa == XC_ISA_AVX512 && xc_has_ifma_ntt()) return "AVX-512 IFMA52 (52b 2-Prime NTT + ZMM Wave)";
+    if (isa == XC_ISA_AVX512 && xc_has_ifma_ntt()) return "AVX-512 IFMA52 (51b Lazy-Harvey NTT + ZMM Wave)";
     if (isa == XC_ISA_AVX512) return "AVX-512 (AoSoA8 ZMM + vmovntpd)";
     if (isa == XC_ISA_AVX2)   return "AVX2+FMA (AoSoA8 Dual-YMM)";
 #if XC_HAS_ARM_NEON
@@ -2398,17 +2398,13 @@ static void dispatch_pass3(xc_plan_t *E, uint64_t *Out_words, size_t n_out_words
 #define XC_NTT_MASK52 ((1ULL << 52) - 1ULL)
 
 typedef struct {
-    uint64_t P, pinv52, r2_mod_p, one_mont;
+    uint64_t P, twoP, pinv52, r2_mod_p, one_mont, wN, iwN, invN;
     size_t R, C, N;
     int logR, logC;
     uint64_t *rdif_wm, *rdif_wp, *rdit_wm, *rdit_wp;
     uint64_t *cdif_wm, *cdif_wp, *cdit_wm, *cdit_wp;
-    uint64_t *step_wm8, *step_wp8;
-    uint64_t *tile_lo_wm, *tile_lo_wp;
-    uint64_t *tile_hi_wm, *tile_hi_wp;
-    uint64_t *istep_wm8, *istep_wp8;
-    uint64_t *itile_lo_wm, *itile_lo_wp;
-    uint64_t *itile_hi_wm, *itile_hi_wp;
+    uint64_t *pow8_wN_m,  *pow8_wN_p;
+    uint64_t *pow8_iwN_m, *pow8_iwN_p;
 } xc_ntt_prime_t;
 
 struct xc_ntt_engine_s {
@@ -2416,9 +2412,10 @@ struct xc_ntt_engine_s {
     size_t R, C, N, stride;
     uint64_t invP1_wm, invP1_wp;
     xc_ntt_prime_t pr1, pr2;
+    uint16_t *brevR;
     uint64_t *A1, *A2, *B1, *B2;
     uint64_t *tbufs1, *tbufs2;
-    uint64_t *blk_carries;
+    int64_t  *blk_carries;
 };
 
 static uint64_t ntt_mod_mul(uint64_t a, uint64_t b, uint64_t p) {
@@ -2442,7 +2439,8 @@ static size_t ntt_bitrev_n(size_t x, int bits) {
 }
 
 static int ntt_build_1d_twiddles(size_t L, uint64_t P, uint64_t g, uint64_t pinv52,
-                                 uint64_t **dif_wm, uint64_t **dif_wp, uint64_t **dit_wm, uint64_t **dit_wp)
+                                 uint64_t **dif_wm, uint64_t **dif_wp, uint64_t **dit_wm, uint64_t **dit_wp,
+                                 int inv_dif)
 {
     *dif_wm = (uint64_t *)xc_aligned_alloc_buf((L + 8) * 8, 0);
     *dif_wp = (uint64_t *)xc_aligned_alloc_buf((L + 8) * 8, 0);
@@ -2450,10 +2448,14 @@ static int ntt_build_1d_twiddles(size_t L, uint64_t P, uint64_t g, uint64_t pinv
     *dit_wp = (uint64_t *)xc_aligned_alloc_buf((L + 8) * 8, 0);
     if (!*dif_wm || !*dif_wp || !*dit_wm || !*dit_wp) return XC_ERR_NOMEM;
 
-    uint64_t wL = ntt_mod_pow(g, (P - 1) / L, P), iwL = ntt_mod_pow(wL, P - 2, P);
+    uint64_t w_fwd = ntt_mod_pow(g, (P - 1) / L, P);
+    uint64_t w_inv = ntt_mod_pow(w_fwd, P - 2, P);
+    uint64_t w_for_dif = inv_dif ? w_inv : w_fwd;
+    uint64_t w_for_dit = inv_dif ? w_fwd : w_inv;
+
     size_t off = 0;
     for (size_t half = L / 2; half >= 1; half >>= 1) {
-        uint64_t step = ntt_mod_pow(wL, L / (2 * half), P), cur = 1;
+        uint64_t step = ntt_mod_pow(w_for_dif, L / (2 * half), P), cur = 1;
         for (size_t k = 0; k < half; k++) {
             uint64_t wm = ntt_to_mont(cur, P);
             (*dif_wm)[off + k] = wm; (*dif_wp)[off + k] = ntt_shoup_pinv(wm, pinv52);
@@ -2463,7 +2465,7 @@ static int ntt_build_1d_twiddles(size_t L, uint64_t P, uint64_t g, uint64_t pinv
     }
     off = 0;
     for (size_t half = 1; half < L; half <<= 1) {
-        uint64_t step = ntt_mod_pow(iwL, L / (2 * half), P), cur = 1;
+        uint64_t step = ntt_mod_pow(w_for_dit, L / (2 * half), P), cur = 1;
         for (size_t k = 0; k < half; k++) {
             uint64_t wm = ntt_to_mont(cur, P);
             (*dit_wm)[off + k] = wm; (*dit_wp)[off + k] = ntt_shoup_pinv(wm, pinv52);
@@ -2479,69 +2481,39 @@ static void ntt_free_prime(xc_ntt_prime_t *pr) {
     xc_aligned_free_buf(pr->rdit_wm); xc_aligned_free_buf(pr->rdit_wp);
     xc_aligned_free_buf(pr->cdif_wm); xc_aligned_free_buf(pr->cdif_wp);
     xc_aligned_free_buf(pr->cdit_wm); xc_aligned_free_buf(pr->cdit_wp);
-    xc_aligned_free_buf(pr->step_wm8);    xc_aligned_free_buf(pr->step_wp8);
-    xc_aligned_free_buf(pr->tile_lo_wm);  xc_aligned_free_buf(pr->tile_lo_wp);
-    xc_aligned_free_buf(pr->tile_hi_wm);  xc_aligned_free_buf(pr->tile_hi_wp);
-    xc_aligned_free_buf(pr->istep_wm8);   xc_aligned_free_buf(pr->istep_wp8);
-    xc_aligned_free_buf(pr->itile_lo_wm); xc_aligned_free_buf(pr->itile_lo_wp);
-    xc_aligned_free_buf(pr->itile_hi_wm); xc_aligned_free_buf(pr->itile_hi_wp);
+    xc_aligned_free_buf(pr->pow8_wN_m);  xc_aligned_free_buf(pr->pow8_wN_p);
+    xc_aligned_free_buf(pr->pow8_iwN_m); xc_aligned_free_buf(pr->pow8_iwN_p);
 }
 
 static int ntt_init_prime(xc_ntt_prime_t *pr, int logR, int logC, uint64_t P, uint64_t g, uint64_t pinv52) {
     memset(pr, 0, sizeof(*pr));
-    pr->P = P; pr->pinv52 = pinv52;
+    pr->P = P; pr->twoP = 2 * P; pr->pinv52 = pinv52;
     pr->one_mont = ntt_to_mont(1, P);
     pr->r2_mod_p = ntt_to_mont(pr->one_mont, P);
     pr->logR = logR; pr->logC = logC;
     pr->R = 1ULL << logR; pr->C = 1ULL << logC; pr->N = pr->R * pr->C;
+    pr->wN   = ntt_mod_pow(g, (P - 1) / pr->N, P);
+    pr->iwN  = ntt_mod_pow(pr->wN, P - 2, P);
+    pr->invN = ntt_mod_pow(pr->N,  P - 2, P);
 
-    if (ntt_build_1d_twiddles(pr->R, P, g, pinv52, &pr->rdif_wm, &pr->rdif_wp, &pr->rdit_wm, &pr->rdit_wp) != XC_OK) return XC_ERR_NOMEM;
-    if (ntt_build_1d_twiddles(pr->C, P, g, pinv52, &pr->cdif_wm, &pr->cdif_wp, &pr->cdit_wm, &pr->cdit_wp) != XC_OK) return XC_ERR_NOMEM;
+    /* Columns use forward DIT (bitrev-in -> natural k1-out) & inverse DIF (natural k1-in -> bitrev-out) */
+    if (ntt_build_1d_twiddles(pr->R, P, g, pinv52, &pr->rdif_wm, &pr->rdif_wp, &pr->rdit_wm, &pr->rdit_wp, 1) != XC_OK) return XC_ERR_NOMEM;
+    /* Rows use forward DIF (natural -> bitrev) & inverse DIT (bitrev -> natural) */
+    if (ntt_build_1d_twiddles(pr->C, P, g, pinv52, &pr->cdif_wm, &pr->cdif_wp, &pr->cdit_wm, &pr->cdit_wp, 0) != XC_OK) return XC_ERR_NOMEM;
 
-    size_t n_tiles8 = pr->C / 8;
-    size_t n_hi = (n_tiles8 >> 4) + 1;
+    pr->pow8_wN_m  = (uint64_t *)xc_aligned_alloc_buf(64, 0);
+    pr->pow8_wN_p  = (uint64_t *)xc_aligned_alloc_buf(64, 0);
+    pr->pow8_iwN_m = (uint64_t *)xc_aligned_alloc_buf(64, 0);
+    pr->pow8_iwN_p = (uint64_t *)xc_aligned_alloc_buf(64, 0);
+    if (!pr->pow8_wN_m || !pr->pow8_wN_p || !pr->pow8_iwN_m || !pr->pow8_iwN_p) return XC_ERR_NOMEM;
 
-    pr->step_wm8    = (uint64_t *)xc_aligned_alloc_buf(pr->R * 8 * 8, 0);
-    pr->step_wp8    = (uint64_t *)xc_aligned_alloc_buf(pr->R * 8 * 8, 0);
-    pr->tile_lo_wm  = (uint64_t *)xc_aligned_alloc_buf(16 * pr->R * 8, 0);
-    pr->tile_lo_wp  = (uint64_t *)xc_aligned_alloc_buf(16 * pr->R * 8, 0);
-    pr->tile_hi_wm  = (uint64_t *)xc_aligned_alloc_buf(n_hi * pr->R * 8, 0);
-    pr->tile_hi_wp  = (uint64_t *)xc_aligned_alloc_buf(n_hi * pr->R * 8, 0);
-    pr->istep_wm8   = (uint64_t *)xc_aligned_alloc_buf(pr->R * 8 * 8, 0);
-    pr->istep_wp8   = (uint64_t *)xc_aligned_alloc_buf(pr->R * 8 * 8, 0);
-    pr->itile_lo_wm = (uint64_t *)xc_aligned_alloc_buf(16 * pr->R * 8, 0);
-    pr->itile_lo_wp = (uint64_t *)xc_aligned_alloc_buf(16 * pr->R * 8, 0);
-    pr->itile_hi_wm = (uint64_t *)xc_aligned_alloc_buf(n_hi * pr->R * 8, 0);
-    pr->itile_hi_wp = (uint64_t *)xc_aligned_alloc_buf(n_hi * pr->R * 8, 0);
-    if (!pr->step_wm8 || !pr->step_wp8 || !pr->tile_lo_wm || !pr->tile_lo_wp ||
-        !pr->tile_hi_wm || !pr->tile_hi_wp || !pr->istep_wm8 || !pr->istep_wp8 ||
-        !pr->itile_lo_wm || !pr->itile_lo_wp || !pr->itile_hi_wm || !pr->itile_hi_wp) return XC_ERR_NOMEM;
-
-    uint64_t wN = ntt_mod_pow(g, (P - 1) / pr->N, P), iwN = ntt_mod_pow(wN, P - 2, P), invN = ntt_mod_pow(pr->N, P - 2, P);
-    for (size_t j = 0; j < pr->R; j++) {
-        size_t k1 = ntt_bitrev_n(j, logR);
-        uint64_t base = ntt_mod_pow(wN, k1, P), ibase = ntt_mod_pow(iwN, k1, P), cur = 1, icur = invN;
-        for (int c = 0; c < 8; c++) {
-            uint64_t wm = ntt_to_mont(cur, P), iwm = ntt_to_mont(icur, P);
-            pr->step_wm8[j * 8 + c]  = wm;  pr->step_wp8[j * 8 + c]  = ntt_shoup_pinv(wm, pinv52);
-            pr->istep_wm8[j * 8 + c] = iwm; pr->istep_wp8[j * 8 + c] = ntt_shoup_pinv(iwm, pinv52);
-            cur = ntt_mod_mul(cur, base, P); icur = ntt_mod_mul(icur, ibase, P);
-        }
-        uint64_t b8 = ntt_mod_pow(base, 8, P), ib8 = ntt_mod_pow(ibase, 8, P);
-        uint64_t b128 = ntt_mod_pow(base, 128, P), ib128 = ntt_mod_pow(ibase, 128, P);
-        uint64_t c_lo = 1, ic_lo = 1, c_hi = 1, ic_hi = 1;
-        for (size_t m = 0; m < 16; m++) {
-            uint64_t wm_lo = ntt_to_mont(c_lo, P), iwm_lo = ntt_to_mont(ic_lo, P);
-            pr->tile_lo_wm[m * pr->R + j]  = wm_lo;  pr->tile_lo_wp[m * pr->R + j]  = ntt_shoup_pinv(wm_lo, pinv52);
-            pr->itile_lo_wm[m * pr->R + j] = iwm_lo; pr->itile_lo_wp[m * pr->R + j] = ntt_shoup_pinv(iwm_lo, pinv52);
-            c_lo = ntt_mod_mul(c_lo, b8, P); ic_lo = ntt_mod_mul(ic_lo, ib8, P);
-        }
-        for (size_t m = 0; m < n_hi; m++) {
-            uint64_t wm_hi = ntt_to_mont(c_hi, P), iwm_hi = ntt_to_mont(ic_hi, P);
-            pr->tile_hi_wm[m * pr->R + j]  = wm_hi;  pr->tile_hi_wp[m * pr->R + j]  = ntt_shoup_pinv(wm_hi, pinv52);
-            pr->itile_hi_wm[m * pr->R + j] = iwm_hi; pr->itile_hi_wp[m * pr->R + j] = ntt_shoup_pinv(iwm_hi, pinv52);
-            c_hi = ntt_mod_mul(c_hi, b128, P); ic_hi = ntt_mod_mul(ic_hi, ib128, P);
-        }
+    uint64_t c_f = 1, c_i = 1;
+    for (int c = 0; c < 8; c++) {
+        uint64_t wf = ntt_to_mont(c_f, P), wi = ntt_to_mont(c_i, P);
+        pr->pow8_wN_m[c]  = wf; pr->pow8_wN_p[c]  = ntt_shoup_pinv(wf, pinv52);
+        pr->pow8_iwN_m[c] = wi; pr->pow8_iwN_p[c] = ntt_shoup_pinv(wi, pinv52);
+        c_f = ntt_mod_mul(c_f, pr->wN,  P);
+        c_i = ntt_mod_mul(c_i, pr->iwN, P);
     }
     return XC_OK;
 }
@@ -2550,6 +2522,7 @@ static void xc_ntt_destroy(xc_ntt_engine_t *eng) {
     if (!eng) return;
     ntt_free_prime(&eng->pr1);
     ntt_free_prime(&eng->pr2);
+    xc_aligned_free_buf(eng->brevR);
     xc_aligned_free_buf(eng->A1); xc_aligned_free_buf(eng->A2);
     xc_aligned_free_buf(eng->B1); xc_aligned_free_buf(eng->B2);
     xc_aligned_free_buf(eng->tbufs1); xc_aligned_free_buf(eng->tbufs2);
@@ -2560,7 +2533,7 @@ static void xc_ntt_destroy(xc_ntt_engine_t *eng) {
 static int xc_ntt_ensure_B(xc_ntt_engine_t *eng) {
     if (eng->B1 && eng->B2) return XC_OK;
     size_t mat_bytes = eng->R * eng->stride * 8;
-    int huge = (mat_bytes >= (2ULL << 20)) && (eng->nt >= 8);
+    int huge = (mat_bytes >= (2ULL << 20));
     if (!eng->B1) eng->B1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     if (!eng->B2) eng->B2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     return (eng->B1 && eng->B2) ? XC_OK : XC_ERR_NOMEM;
@@ -2578,17 +2551,22 @@ static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch, int alloc_B) {
     eng->stride = eng->C + 8;
     eng->nt = xc_wave_threads(eng->N);
 
-    const uint64_t P1 = 0xffffe20000001ULL, PINV1 = 0x00001e0000001ULL;
-    const uint64_t P2 = 0xffffe08000001ULL, PINV2 = 0x00001f8000001ULL;
-    if (ntt_init_prime(&eng->pr1, eng->logR, eng->logC, P1, 3, PINV1) != XC_OK ||
+    /* 51-bit NTT primes (2P < 2^52 => zero vpminuq on all lazy Shoup butterfly multiplies!) */
+    const uint64_t P1 = 0x7ffffa4000001ULL, PINV1 = 0x800005c000001ULL;
+    const uint64_t P2 = 0x7ffff90000001ULL, PINV2 = 0x8000070000001ULL;
+    if (ntt_init_prime(&eng->pr1, eng->logR, eng->logC, P1, 5, PINV1) != XC_OK ||
         ntt_init_prime(&eng->pr2, eng->logR, eng->logC, P2, 3, PINV2) != XC_OK) {
         xc_ntt_destroy(eng); return NULL;
     }
     eng->invP1_wm = ntt_to_mont(ntt_mod_pow(P1 % P2, P2 - 2, P2), P2);
     eng->invP1_wp = ntt_shoup_pinv(eng->invP1_wm, PINV2);
 
+    eng->brevR = (uint16_t *)xc_aligned_alloc_buf(eng->R * sizeof(uint16_t), 0);
+    if (!eng->brevR) { xc_ntt_destroy(eng); return NULL; }
+    for (size_t j = 0; j < eng->R; j++) eng->brevR[j] = (uint16_t)ntt_bitrev_n(j, eng->logR);
+
     size_t mat_bytes = eng->R * eng->stride * 8;
-    int huge = (mat_bytes >= (2ULL << 20)) && (eng->nt >= 8);
+    int huge = (mat_bytes >= (2ULL << 20));
     eng->A1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     eng->A2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     if (alloc_B) {
@@ -2596,10 +2574,10 @@ static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch, int alloc_B) {
         eng->B2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     }
     size_t tbuf_bytes = (size_t)eng->nt * (eng->R + 2) * 8 * 8;
-    eng->tbufs1 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, tbuf_bytes >= (2ULL << 20));
-    eng->tbufs2 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, tbuf_bytes >= (2ULL << 20));
+    eng->tbufs1 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, (tbuf_bytes >= (2ULL << 20)));
+    eng->tbufs2 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, (tbuf_bytes >= (2ULL << 20)));
     size_t cy_bytes = (eng->N / 8) * 8;
-    eng->blk_carries = (uint64_t *)xc_aligned_alloc_buf(cy_bytes, cy_bytes >= (2ULL << 20));
+    eng->blk_carries = (int64_t *)xc_aligned_alloc_buf(cy_bytes, (cy_bytes >= (2ULL << 20)));
     if (!eng->A1 || !eng->A2 || (alloc_B && (!eng->B1 || !eng->B2)) ||
         !eng->tbufs1 || !eng->tbufs2 || !eng->blk_carries) {
         xc_ntt_destroy(eng); return NULL;
@@ -2619,31 +2597,31 @@ static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch, int alloc_B) {
     return eng;
 }
 
-XC_TARGET_IFMA_NTT static inline __m512i ntt_mul_shoup52(__m512i d, __m512i wm, __m512i wp, __m512i vP, __m512i z) {
+/* Lazy Shoup multiply for 51-bit prime (2P < 2^52): d in [0, 2P) -> returns (0, 2P) with ZERO vpminuq! */
+XC_TARGET_IFMA_NTT static inline __m512i ntt_mul_shoup_2p(__m512i d, __m512i wm, __m512i wp, __m512i vP, __m512i z) {
     __m512i hi = _mm512_madd52hi_epu64(vP, d, wm);
     __m512i q  = _mm512_madd52lo_epu64(z,  d, wp);
-    __m512i t  = _mm512_sub_epi64(hi, _mm512_madd52hi_epu64(z, q, vP));
-    return _mm512_min_epu64(t, _mm512_sub_epi64(t, vP));
+    return _mm512_sub_epi64(hi, _mm512_madd52hi_epu64(z, q, vP));
 }
-XC_TARGET_IFMA_NTT static inline __m512i ntt_mul_mont52(__m512i a, __m512i b, __m512i vP, __m512i vPinv, __m512i z) {
+XC_TARGET_IFMA_NTT static inline __m512i ntt_mul_mont_2p(__m512i a, __m512i b, __m512i vP, __m512i v2P, __m512i vPinv, __m512i z) {
     __m512i lo = _mm512_madd52lo_epu64(z,  a, b);
     __m512i hi = _mm512_madd52hi_epu64(vP, a, b);
     __m512i q  = _mm512_madd52lo_epu64(z,  lo, vPinv);
     __m512i t  = _mm512_sub_epi64(hi, _mm512_madd52hi_epu64(z, q, vP));
-    return _mm512_min_epu64(t, _mm512_sub_epi64(t, vP));
+    return _mm512_min_epu64(t, _mm512_sub_epi64(t, v2P));
 }
-XC_TARGET_IFMA_NTT static inline __m512i ntt_add_mod52(__m512i a, __m512i b, __m512i vP) {
+XC_TARGET_IFMA_NTT static inline __m512i ntt_add_2p(__m512i a, __m512i b, __m512i v2P) {
     __m512i s = _mm512_add_epi64(a, b);
-    return _mm512_min_epu64(s, _mm512_sub_epi64(s, vP));
+    return _mm512_min_epu64(s, _mm512_sub_epi64(s, v2P));
 }
-XC_TARGET_IFMA_NTT static inline __m512i ntt_sub_mod52(__m512i a, __m512i b, __m512i vP) {
-    __m512i d = _mm512_add_epi64(_mm512_sub_epi64(a, b), vP);
-    return _mm512_min_epu64(d, _mm512_sub_epi64(d, vP));
+XC_TARGET_IFMA_NTT static inline __m512i ntt_sub_2p(__m512i a, __m512i b, __m512i v2P) {
+    __m512i d = _mm512_add_epi64(_mm512_sub_epi64(a, b), v2P);
+    return _mm512_min_epu64(d, _mm512_sub_epi64(d, v2P));
 }
 
 XC_TARGET_IFMA_NTT static void ntt_row_dif_C(uint64_t * restrict row, const xc_ntt_prime_t *pr) {
     const size_t C = pr->C;
-    const __m512i vP = _mm512_set1_epi64((long long)pr->P), z = _mm512_setzero_si512();
+    const __m512i vP = _mm512_set1_epi64((long long)pr->P), v2P = _mm512_set1_epi64((long long)pr->twoP), z = _mm512_setzero_si512();
     size_t off = 0, half = C >> 1;
 
     while (half >= 16) {
@@ -2657,21 +2635,21 @@ XC_TARGET_IFMA_NTT static void ntt_row_dif_C(uint64_t * restrict row, const xc_n
                 __m512i x2 = _mm512_load_si512((const __m512i *)(row + base + half + k));
                 __m512i x3 = _mm512_load_si512((const __m512i *)(row + base + half + qtr + k));
 
-                __m512i a0 = ntt_add_mod52(x0, x2, vP);
-                __m512i a2 = ntt_mul_shoup52(ntt_sub_mod52(x0, x2, vP),
+                __m512i a0 = ntt_add_2p(x0, x2, v2P);
+                __m512i a2 = ntt_mul_shoup_2p(ntt_sub_2p(x0, x2, v2P),
                                 _mm512_loadu_si512((const void *)(wm1_p + k)),
                                 _mm512_loadu_si512((const void *)(wp1_p + k)), vP, z);
-                __m512i a1 = ntt_add_mod52(x1, x3, vP);
-                __m512i a3 = ntt_mul_shoup52(ntt_sub_mod52(x1, x3, vP),
+                __m512i a1 = ntt_add_2p(x1, x3, v2P);
+                __m512i a3 = ntt_mul_shoup_2p(ntt_sub_2p(x1, x3, v2P),
                                 _mm512_loadu_si512((const void *)(wm1_p + qtr + k)),
                                 _mm512_loadu_si512((const void *)(wp1_p + qtr + k)), vP, z);
 
                 __m512i w2m = _mm512_loadu_si512((const void *)(wm2_p + k));
                 __m512i w2p = _mm512_loadu_si512((const void *)(wp2_p + k));
-                _mm512_store_si512((__m512i *)(row + base + k),              ntt_add_mod52(a0, a1, vP));
-                _mm512_store_si512((__m512i *)(row + base + qtr + k),        ntt_mul_shoup52(ntt_sub_mod52(a0, a1, vP), w2m, w2p, vP, z));
-                _mm512_store_si512((__m512i *)(row + base + half + k),       ntt_add_mod52(a2, a3, vP));
-                _mm512_store_si512((__m512i *)(row + base + half + qtr + k), ntt_mul_shoup52(ntt_sub_mod52(a2, a3, vP), w2m, w2p, vP, z));
+                _mm512_store_si512((__m512i *)(row + base + k),              ntt_add_2p(a0, a1, v2P));
+                _mm512_store_si512((__m512i *)(row + base + qtr + k),        ntt_mul_shoup_2p(ntt_sub_2p(a0, a1, v2P), w2m, w2p, vP, z));
+                _mm512_store_si512((__m512i *)(row + base + half + k),       ntt_add_2p(a2, a3, v2P));
+                _mm512_store_si512((__m512i *)(row + base + half + qtr + k), ntt_mul_shoup_2p(ntt_sub_2p(a2, a3, v2P), w2m, w2p, vP, z));
             }
         }
         off += half + qtr;
@@ -2683,8 +2661,8 @@ XC_TARGET_IFMA_NTT static void ntt_row_dif_C(uint64_t * restrict row, const xc_n
         for (size_t base = 0; base < C; base += 16) {
             __m512i u = _mm512_load_si512((const __m512i *)(row + base));
             __m512i v = _mm512_load_si512((const __m512i *)(row + base + 8));
-            _mm512_store_si512((__m512i *)(row + base),     ntt_add_mod52(u, v, vP));
-            _mm512_store_si512((__m512i *)(row + base + 8), ntt_mul_shoup52(ntt_sub_mod52(u, v, vP), wm, wp, vP, z));
+            _mm512_store_si512((__m512i *)(row + base),     ntt_add_2p(u, v, v2P));
+            _mm512_store_si512((__m512i *)(row + base + 8), ntt_mul_shoup_2p(ntt_sub_2p(u, v, v2P), wm, wp, vP, z));
         }
         off += 8;
     }
@@ -2703,18 +2681,18 @@ XC_TARGET_IFMA_NTT static void ntt_row_dif_C(uint64_t * restrict row, const xc_n
     for (size_t base = 0; base < C; base += 8) {
         __m512i x = _mm512_load_si512((const __m512i *)(row + base));
         __m512i u = _mm512_permutexvar_epi64(idx4_u, x), v = _mm512_permutexvar_epi64(idx4_v, x);
-        x = _mm512_mask_blend_epi64(0xF0, ntt_add_mod52(u, v, vP), ntt_mul_shoup52(ntt_sub_mod52(u, v, vP), v_wm4, v_wp4, vP, z));
+        x = _mm512_mask_blend_epi64(0xF0, ntt_add_2p(u, v, v2P), ntt_mul_shoup_2p(ntt_sub_2p(u, v, v2P), v_wm4, v_wp4, vP, z));
         u = _mm512_permutexvar_epi64(idx2_u, x); v = _mm512_permutexvar_epi64(idx2_v, x);
-        x = _mm512_mask_blend_epi64(0xCC, ntt_add_mod52(u, v, vP), ntt_mul_shoup52(ntt_sub_mod52(u, v, vP), v_wm2, v_wp2, vP, z));
+        x = _mm512_mask_blend_epi64(0xCC, ntt_add_2p(u, v, v2P), ntt_mul_shoup_2p(ntt_sub_2p(u, v, v2P), v_wm2, v_wp2, vP, z));
         u = _mm512_permutexvar_epi64(idx1_u, x); v = _mm512_permutexvar_epi64(idx1_v, x);
-        x = _mm512_mask_blend_epi64(0xAA, ntt_add_mod52(u, v, vP), ntt_mul_shoup52(ntt_sub_mod52(u, v, vP), v_wm1, v_wp1, vP, z));
+        x = _mm512_mask_blend_epi64(0xAA, ntt_add_2p(u, v, v2P), ntt_mul_shoup_2p(ntt_sub_2p(u, v, v2P), v_wm1, v_wp1, vP, z));
         _mm512_store_si512((__m512i *)(row + base), x);
     }
 }
 
 XC_TARGET_IFMA_NTT static void ntt_row_idit_C(uint64_t * restrict row, const xc_ntt_prime_t *pr) {
     const size_t C = pr->C;
-    const __m512i vP = _mm512_set1_epi64((long long)pr->P), z = _mm512_setzero_si512();
+    const __m512i vP = _mm512_set1_epi64((long long)pr->P), v2P = _mm512_set1_epi64((long long)pr->twoP), z = _mm512_setzero_si512();
     const uint64_t wm1_0 = pr->cdit_wm[0], wp1_0 = pr->cdit_wp[0];
     const uint64_t *wm2 = pr->cdit_wm + 1, *wp2 = pr->cdit_wp + 1;
     const uint64_t *wm4 = pr->cdit_wm + 3, *wp4 = pr->cdit_wp + 3;
@@ -2730,14 +2708,14 @@ XC_TARGET_IFMA_NTT static void ntt_row_idit_C(uint64_t * restrict row, const xc_
     for (size_t base = 0; base < C; base += 8) {
         __m512i x = _mm512_load_si512((const __m512i *)(row + base));
         __m512i u = _mm512_permutexvar_epi64(idx1_u, x);
-        __m512i v = ntt_mul_shoup52(_mm512_permutexvar_epi64(idx1_v, x), v_wm1, v_wp1, vP, z);
-        x = _mm512_mask_blend_epi64(0xAA, ntt_add_mod52(u, v, vP), ntt_sub_mod52(u, v, vP));
+        __m512i v = ntt_mul_shoup_2p(_mm512_permutexvar_epi64(idx1_v, x), v_wm1, v_wp1, vP, z);
+        x = _mm512_mask_blend_epi64(0xAA, ntt_add_2p(u, v, v2P), ntt_sub_2p(u, v, v2P));
         u = _mm512_permutexvar_epi64(idx2_u, x);
-        v = ntt_mul_shoup52(_mm512_permutexvar_epi64(idx2_v, x), v_wm2, v_wp2, vP, z);
-        x = _mm512_mask_blend_epi64(0xCC, ntt_add_mod52(u, v, vP), ntt_sub_mod52(u, v, vP));
+        v = ntt_mul_shoup_2p(_mm512_permutexvar_epi64(idx2_v, x), v_wm2, v_wp2, vP, z);
+        x = _mm512_mask_blend_epi64(0xCC, ntt_add_2p(u, v, v2P), ntt_sub_2p(u, v, v2P));
         u = _mm512_permutexvar_epi64(idx4_u, x);
-        v = ntt_mul_shoup52(_mm512_permutexvar_epi64(idx4_v, x), v_wm4, v_wp4, vP, z);
-        x = _mm512_mask_blend_epi64(0xF0, ntt_add_mod52(u, v, vP), ntt_sub_mod52(u, v, vP));
+        v = ntt_mul_shoup_2p(_mm512_permutexvar_epi64(idx4_v, x), v_wm4, v_wp4, vP, z);
+        x = _mm512_mask_blend_epi64(0xF0, ntt_add_2p(u, v, v2P), ntt_sub_2p(u, v, v2P));
         _mm512_store_si512((__m512i *)(row + base), x);
     }
 
@@ -2747,9 +2725,9 @@ XC_TARGET_IFMA_NTT static void ntt_row_idit_C(uint64_t * restrict row, const xc_
         __m512i wp = _mm512_loadu_si512((const void *)(pr->cdit_wp + off));
         for (size_t base = 0; base < C; base += 16) {
             __m512i u  = _mm512_load_si512((const __m512i *)(row + base));
-            __m512i vw = ntt_mul_shoup52(_mm512_load_si512((const __m512i *)(row + base + 8)), wm, wp, vP, z);
-            _mm512_store_si512((__m512i *)(row + base),     ntt_add_mod52(u, vw, vP));
-            _mm512_store_si512((__m512i *)(row + base + 8), ntt_sub_mod52(u, vw, vP));
+            __m512i vw = ntt_mul_shoup_2p(_mm512_load_si512((const __m512i *)(row + base + 8)), wm, wp, vP, z);
+            _mm512_store_si512((__m512i *)(row + base),     ntt_add_2p(u, vw, v2P));
+            _mm512_store_si512((__m512i *)(row + base + 8), ntt_sub_2p(u, vw, v2P));
         }
         off += 8;
         half = 16;
@@ -2767,19 +2745,19 @@ XC_TARGET_IFMA_NTT static void ntt_row_idit_C(uint64_t * restrict row, const xc_
 
                 __m512i w1m = _mm512_loadu_si512((const void *)(wm1_p + k));
                 __m512i w1p = _mm512_loadu_si512((const void *)(wp1_p + k));
-                __m512i v1 = ntt_mul_shoup52(x1, w1m, w1p, vP, z);
-                __m512i v3 = ntt_mul_shoup52(x3, w1m, w1p, vP, z);
-                __m512i a0 = ntt_add_mod52(x0, v1, vP), a1 = ntt_sub_mod52(x0, v1, vP);
-                __m512i a2 = ntt_add_mod52(x2, v3, vP), a3 = ntt_sub_mod52(x2, v3, vP);
+                __m512i v1 = ntt_mul_shoup_2p(x1, w1m, w1p, vP, z);
+                __m512i v3 = ntt_mul_shoup_2p(x3, w1m, w1p, vP, z);
+                __m512i a0 = ntt_add_2p(x0, v1, v2P), a1 = ntt_sub_2p(x0, v1, v2P);
+                __m512i a2 = ntt_add_2p(x2, v3, v2P), a3 = ntt_sub_2p(x2, v3, v2P);
 
-                __m512i t2 = ntt_mul_shoup52(a2, _mm512_loadu_si512((const void *)(wm2_p + k)),
-                                                 _mm512_loadu_si512((const void *)(wp2_p + k)), vP, z);
-                __m512i t3 = ntt_mul_shoup52(a3, _mm512_loadu_si512((const void *)(wm2_p + half + k)),
-                                                 _mm512_loadu_si512((const void *)(wp2_p + half + k)), vP, z);
-                _mm512_store_si512((__m512i *)(row + base + k),              ntt_add_mod52(a0, t2, vP));
-                _mm512_store_si512((__m512i *)(row + base + half + k),       ntt_add_mod52(a1, t3, vP));
-                _mm512_store_si512((__m512i *)(row + base + dbl + k),        ntt_sub_mod52(a0, t2, vP));
-                _mm512_store_si512((__m512i *)(row + base + dbl + half + k), ntt_sub_mod52(a1, t3, vP));
+                __m512i t2 = ntt_mul_shoup_2p(a2, _mm512_loadu_si512((const void *)(wm2_p + k)),
+                                                  _mm512_loadu_si512((const void *)(wp2_p + k)), vP, z);
+                __m512i t3 = ntt_mul_shoup_2p(a3, _mm512_loadu_si512((const void *)(wm2_p + half + k)),
+                                                  _mm512_loadu_si512((const void *)(wp2_p + half + k)), vP, z);
+                _mm512_store_si512((__m512i *)(row + base + k),              ntt_add_2p(a0, t2, v2P));
+                _mm512_store_si512((__m512i *)(row + base + half + k),       ntt_add_2p(a1, t3, v2P));
+                _mm512_store_si512((__m512i *)(row + base + dbl + k),        ntt_sub_2p(a0, t2, v2P));
+                _mm512_store_si512((__m512i *)(row + base + dbl + half + k), ntt_sub_2p(a1, t3, v2P));
             }
         }
         off += half + dbl;
@@ -2790,11 +2768,11 @@ XC_TARGET_IFMA_NTT static void ntt_row_idit_C(uint64_t * restrict row, const xc_
 XC_TARGET_IFMA_NTT static void ntt_row_fused_convolve_C(uint64_t * restrict rowA, const uint64_t * restrict rowB, const xc_ntt_prime_t *pr) {
     ntt_row_dif_C(rowA, pr);
     const size_t C = pr->C;
-    const __m512i vP = _mm512_set1_epi64((long long)pr->P), vPinv = _mm512_set1_epi64((long long)pr->pinv52), z = _mm512_setzero_si512();
+    const __m512i vP = _mm512_set1_epi64((long long)pr->P), v2P = _mm512_set1_epi64((long long)pr->twoP), vPinv = _mm512_set1_epi64((long long)pr->pinv52), z = _mm512_setzero_si512();
     for (size_t c = 0; c < C; c += 8) {
         __m512i a = _mm512_load_si512((const __m512i *)(rowA + c));
         __m512i b = _mm512_load_si512((const __m512i *)(rowB + c));
-        _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont52(a, b, vP, vPinv, z));
+        _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont_2p(a, b, vP, v2P, vPinv, z));
     }
     ntt_row_idit_C(rowA, pr);
 }
@@ -2802,23 +2780,25 @@ XC_TARGET_IFMA_NTT static void ntt_row_fused_convolve_C(uint64_t * restrict rowA
 XC_TARGET_IFMA_NTT static void ntt_row_fused_square_C(uint64_t * restrict rowA, const xc_ntt_prime_t *pr) {
     ntt_row_dif_C(rowA, pr);
     const size_t C = pr->C;
-    const __m512i vP = _mm512_set1_epi64((long long)pr->P), vPinv = _mm512_set1_epi64((long long)pr->pinv52), z = _mm512_setzero_si512();
+    const __m512i vP = _mm512_set1_epi64((long long)pr->P), v2P = _mm512_set1_epi64((long long)pr->twoP), vPinv = _mm512_set1_epi64((long long)pr->pinv52), z = _mm512_setzero_si512();
     for (size_t c = 0; c < C; c += 8) {
         __m512i a = _mm512_load_si512((const __m512i *)(rowA + c));
-        _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont52(a, a, vP, vPinv, z));
+        _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont_2p(a, a, vP, v2P, vPinv, z));
     }
     ntt_row_idit_C(rowA, pr);
 }
 
-XC_TARGET_IFMA_NTT static void ntt_unpack_col_dif_dual_tile8(
+/* Table-free Carry-Free 40-Bit Vedic Vinculum Unpack + Forward Column DIT + Sequential Twiddle!
+   Zero local stack arrays inside XC_TARGET_IFMA_NTT for 100% GCC 14 ASan compatibility! */
+XC_TARGET_IFMA_NTT static void ntt_unpack_col_dit_dual_tile8(
     uint64_t * restrict mat1, uint64_t * restrict mat2, size_t stride,
-    const uint8_t * restrict a_bytes, size_t total_bytes,
+    const uint8_t * restrict a_bytes, size_t total_bytes, const uint16_t * restrict brevR,
     size_t tile8, uint64_t * restrict buf1, uint64_t * restrict buf2,
     const xc_ntt_prime_t *pr1, const xc_ntt_prime_t *pr2)
 {
     const size_t R = pr1->R, C = pr1->C, c0 = tile8 * 8;
-    const __m512i vP1 = _mm512_set1_epi64((long long)pr1->P), vPinv1 = _mm512_set1_epi64((long long)pr1->pinv52);
-    const __m512i vP2 = _mm512_set1_epi64((long long)pr2->P), vPinv2 = _mm512_set1_epi64((long long)pr2->pinv52);
+    const __m512i vP1 = _mm512_set1_epi64((long long)pr1->P), v2P1 = _mm512_set1_epi64((long long)pr1->twoP), vPinv1 = _mm512_set1_epi64((long long)pr1->pinv52);
+    const __m512i vP2 = _mm512_set1_epi64((long long)pr2->P), v2P2 = _mm512_set1_epi64((long long)pr2->twoP), vPinv2 = _mm512_set1_epi64((long long)pr2->pinv52);
     const __m512i z   = _mm512_setzero_si512();
     const __m512i perm40 = _mm512_setr_epi64(
         0x0000000403020100ULL, 0x0000000908070605ULL,
@@ -2826,133 +2806,46 @@ XC_TARGET_IFMA_NTT static void ntt_unpack_col_dif_dual_tile8(
         0x0000001817161514ULL, 0x0000001D1C1B1A19ULL,
         0x0000002221201F1EULL, 0x0000002726252423ULL);
     const __mmask64 keep5 = 0x1F1F1F1F1F1F1F1FULL;
+    const size_t n_limbs40 = (total_bytes + 4) / 5;
 
     for (size_t r = 0; r < R; r++) {
-        size_t boff = (r * C + c0) * 5;
-        __m512i x0;
-        if (__builtin_expect(boff + 64 <= total_bytes, 1)) {
-            x0 = _mm512_maskz_permutexvar_epi8(keep5, perm40, _mm512_loadu_si512((const void *)(a_bytes + boff)));
-        } else if (boff >= total_bytes) {
-            x0 = z;
+        size_t dst_slot = (size_t)brevR[r] * 8;
+        size_t idx0 = r * C + c0;
+        size_t boff = idx0 * 5;
+        __m512i d_signed;
+        if (__builtin_expect(boff >= 1 && boff + 64 <= total_bytes, 1)) {
+            __m512i raw = _mm512_loadu_si512((const void *)(a_bytes + boff));
+            __m512i u   = _mm512_maskz_permutexvar_epi8(keep5, perm40, raw);
+            __m512i sm  = _mm512_srli_epi64(u, 39);
+            uint64_t sp0 = (uint64_t)(a_bytes[boff - 1] >> 7);
+            __m512i sp  = _mm512_alignr_epi64(sm, _mm512_set1_epi64((long long)sp0), 7);
+            d_signed    = _mm512_sub_epi64(_mm512_add_epi64(u, sp), _mm512_slli_epi64(sm, 40));
+        } else if (idx0 > n_limbs40) {
+            _mm512_store_si512((__m512i *)(buf1 + dst_slot), z);
+            _mm512_store_si512((__m512i *)(buf2 + dst_slot), z);
+            continue;
         } else {
-            uint64_t * tail_sc = buf1 + r * 8;
+            uint64_t *sc = buf1 + dst_slot;
             for (int j = 0; j < 8; j++) {
-                size_t b = boff + (size_t)j * 5;
-                uint64_t v = 0;
+                size_t idx = idx0 + (size_t)j;
+                size_t b = idx * 5;
+                uint64_t u = 0;
                 if (b < total_bytes) {
-                    for (size_t k = 0; k < 5 && b + k < total_bytes; k++) v |= ((uint64_t)a_bytes[b + k]) << (8 * k);
+                    for (size_t k = 0; k < 5 && b + k < total_bytes; k++) u |= ((uint64_t)a_bytes[b + k]) << (8 * k);
                 }
-                tail_sc[j] = v;
+                uint64_t sm = (idx < n_limbs40) ? (u >> 39) : 0ULL;
+                uint64_t sp = 0ULL;
+                if (idx > 0 && idx <= n_limbs40) {
+                    size_t bp = idx * 5 - 1;
+                    if (bp < total_bytes) sp = (uint64_t)(a_bytes[bp] >> 7);
+                }
+                sc[j] = (uint64_t)((int64_t)u + (int64_t)sp - (int64_t)(sm << 40));
             }
-            x0 = _mm512_load_si512((const __m512i *)tail_sc);
+            d_signed = _mm512_load_si512((const __m512i *)sc);
         }
-        _mm512_store_si512((__m512i *)(buf1 + r * 8), x0);
-        _mm512_store_si512((__m512i *)(buf2 + r * 8), x0);
-    }
-
-    size_t off = 0, half = R >> 1;
-    while (half >= 2) {
-        size_t qtr = half >> 1, step = half << 1;
-        const uint64_t *wm1_a = pr1->rdif_wm + off, *wp1_a = pr1->rdif_wp + off;
-        const uint64_t *wm1_b = pr1->rdif_wm + off + half, *wp1_b = pr1->rdif_wp + off + half;
-        const uint64_t *wm2_a = pr2->rdif_wm + off, *wp2_a = pr2->rdif_wp + off;
-        const uint64_t *wm2_b = pr2->rdif_wm + off + half, *wp2_b = pr2->rdif_wp + off + half;
-
-        for (size_t base = 0; base < R; base += step) {
-            for (size_t k = 0; k < qtr; k++) {
-                size_t i0 = (base + k) * 8, i1 = (base + qtr + k) * 8, i2 = (base + half + k) * 8, i3 = (base + half + qtr + k) * 8;
-                {
-                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf1 + i0)), x1 = _mm512_load_si512((const __m512i *)(buf1 + i1));
-                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf1 + i2)), x3 = _mm512_load_si512((const __m512i *)(buf1 + i3));
-                    __m512i a0 = ntt_add_mod52(x0, x2, vP1);
-                    __m512i a2 = ntt_mul_shoup52(ntt_sub_mod52(x0, x2, vP1), _mm512_set1_epi64((long long)wm1_a[k]), _mm512_set1_epi64((long long)wp1_a[k]), vP1, z);
-                    __m512i a1 = ntt_add_mod52(x1, x3, vP1);
-                    __m512i a3 = ntt_mul_shoup52(ntt_sub_mod52(x1, x3, vP1), _mm512_set1_epi64((long long)wm1_a[qtr+k]), _mm512_set1_epi64((long long)wp1_a[qtr+k]), vP1, z);
-                    __m512i wbm = _mm512_set1_epi64((long long)wm1_b[k]), wbp = _mm512_set1_epi64((long long)wp1_b[k]);
-                    _mm512_store_si512((__m512i *)(buf1 + i0), ntt_add_mod52(a0, a1, vP1));
-                    _mm512_store_si512((__m512i *)(buf1 + i1), ntt_mul_shoup52(ntt_sub_mod52(a0, a1, vP1), wbm, wbp, vP1, z));
-                    _mm512_store_si512((__m512i *)(buf1 + i2), ntt_add_mod52(a2, a3, vP1));
-                    _mm512_store_si512((__m512i *)(buf1 + i3), ntt_mul_shoup52(ntt_sub_mod52(a2, a3, vP1), wbm, wbp, vP1, z));
-                }
-                {
-                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf2 + i0)), x1 = _mm512_load_si512((const __m512i *)(buf2 + i1));
-                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf2 + i2)), x3 = _mm512_load_si512((const __m512i *)(buf2 + i3));
-                    __m512i a0 = ntt_add_mod52(x0, x2, vP2);
-                    __m512i a2 = ntt_mul_shoup52(ntt_sub_mod52(x0, x2, vP2), _mm512_set1_epi64((long long)wm2_a[k]), _mm512_set1_epi64((long long)wp2_a[k]), vP2, z);
-                    __m512i a1 = ntt_add_mod52(x1, x3, vP2);
-                    __m512i a3 = ntt_mul_shoup52(ntt_sub_mod52(x1, x3, vP2), _mm512_set1_epi64((long long)wm2_a[qtr+k]), _mm512_set1_epi64((long long)wp2_a[qtr+k]), vP2, z);
-                    __m512i wbm = _mm512_set1_epi64((long long)wm2_b[k]), wbp = _mm512_set1_epi64((long long)wp2_b[k]);
-                    _mm512_store_si512((__m512i *)(buf2 + i0), ntt_add_mod52(a0, a1, vP2));
-                    _mm512_store_si512((__m512i *)(buf2 + i1), ntt_mul_shoup52(ntt_sub_mod52(a0, a1, vP2), wbm, wbp, vP2, z));
-                    _mm512_store_si512((__m512i *)(buf2 + i2), ntt_add_mod52(a2, a3, vP2));
-                    _mm512_store_si512((__m512i *)(buf2 + i3), ntt_mul_shoup52(ntt_sub_mod52(a2, a3, vP2), wbm, wbp, vP2, z));
-                }
-            }
-        }
-        off += half + qtr;
-        half >>= 2;
-    }
-    if (half == 1) {
-        __m512i w1m = _mm512_set1_epi64((long long)pr1->rdif_wm[off]), w1p = _mm512_set1_epi64((long long)pr1->rdif_wp[off]);
-        __m512i w2m = _mm512_set1_epi64((long long)pr2->rdif_wm[off]), w2p = _mm512_set1_epi64((long long)pr2->rdif_wp[off]);
-        for (size_t base = 0; base < R; base += 2) {
-            __m512i u1 = _mm512_load_si512((const __m512i *)(buf1 + base*8)), v1 = _mm512_load_si512((const __m512i *)(buf1 + (base+1)*8));
-            _mm512_store_si512((__m512i *)(buf1 + base*8),     ntt_add_mod52(u1, v1, vP1));
-            _mm512_store_si512((__m512i *)(buf1 + (base+1)*8), ntt_mul_shoup52(ntt_sub_mod52(u1, v1, vP1), w1m, w1p, vP1, z));
-            __m512i u2 = _mm512_load_si512((const __m512i *)(buf2 + base*8)), v2 = _mm512_load_si512((const __m512i *)(buf2 + (base+1)*8));
-            _mm512_store_si512((__m512i *)(buf2 + base*8),     ntt_add_mod52(u2, v2, vP2));
-            _mm512_store_si512((__m512i *)(buf2 + (base+1)*8), ntt_mul_shoup52(ntt_sub_mod52(u2, v2, vP2), w2m, w2p, vP2, z));
-        }
-    }
-
-    size_t lo4 = tile8 & 15ULL, hi = tile8 >> 4;
-    const uint64_t *tlo1_m = pr1->tile_lo_wm + lo4 * R, *thi1_m = pr1->tile_hi_wm + hi * R, *thi1_p = pr1->tile_hi_wp + hi * R;
-    const uint64_t *tlo2_m = pr2->tile_lo_wm + lo4 * R, *thi2_m = pr2->tile_hi_wm + hi * R, *thi2_p = pr2->tile_hi_wp + hi * R;
-    int stream = (R * C * 8 >= (32ULL << 20));
-
-    for (size_t j = 0; j < R; j++) {
-        __m512i base1 = ntt_mul_shoup52(_mm512_set1_epi64((long long)tlo1_m[j]), _mm512_set1_epi64((long long)thi1_m[j]), _mm512_set1_epi64((long long)thi1_p[j]), vP1, z);
-        __m512i w1 = ntt_mul_shoup52(base1, _mm512_load_si512((const __m512i *)(pr1->step_wm8 + j*8)), _mm512_load_si512((const __m512i *)(pr1->step_wp8 + j*8)), vP1, z);
-        __m512i y1 = ntt_mul_mont52(_mm512_load_si512((const __m512i *)(buf1 + j*8)), w1, vP1, vPinv1, z);
-
-        __m512i base2 = ntt_mul_shoup52(_mm512_set1_epi64((long long)tlo2_m[j]), _mm512_set1_epi64((long long)thi2_m[j]), _mm512_set1_epi64((long long)thi2_p[j]), vP2, z);
-        __m512i w2 = ntt_mul_shoup52(base2, _mm512_load_si512((const __m512i *)(pr2->step_wm8 + j*8)), _mm512_load_si512((const __m512i *)(pr2->step_wp8 + j*8)), vP2, z);
-        __m512i y2 = ntt_mul_mont52(_mm512_load_si512((const __m512i *)(buf2 + j*8)), w2, vP2, vPinv2, z);
-
-        if (stream) {
-            _mm512_stream_si512((__m512i *)(mat1 + j * stride + c0), y1);
-            _mm512_stream_si512((__m512i *)(mat2 + j * stride + c0), y2);
-        } else {
-            _mm512_store_si512((__m512i *)(mat1 + j * stride + c0), y1);
-            _mm512_store_si512((__m512i *)(mat2 + j * stride + c0), y2);
-        }
-    }
-}
-
-XC_TARGET_IFMA_NTT static void ntt_col_idit_crt_pack_tile8(
-    const uint64_t * restrict mat1, const uint64_t * restrict mat2, size_t stride,
-    uint64_t * restrict c_out, size_t out_u64, uint64_t * restrict blk_carries,
-    size_t tile8, uint64_t * restrict buf1, uint64_t * restrict buf2,
-    const xc_ntt_prime_t *pr1, const xc_ntt_prime_t *pr2,
-    uint64_t invP1_wm, uint64_t invP1_wp)
-{
-    const size_t R = pr1->R, n_tiles8 = pr1->C / 8, c0 = tile8 * 8;
-    const __m512i vP1 = _mm512_set1_epi64((long long)pr1->P), vPinv1 = _mm512_set1_epi64((long long)pr1->pinv52);
-    const __m512i vP2 = _mm512_set1_epi64((long long)pr2->P), vPinv2 = _mm512_set1_epi64((long long)pr2->pinv52);
-    const __m512i z   = _mm512_setzero_si512();
-
-    size_t lo4 = tile8 & 15ULL, hi = tile8 >> 4;
-    const uint64_t *tlo1_m = pr1->itile_lo_wm + lo4 * R, *thi1_m = pr1->itile_hi_wm + hi * R, *thi1_p = pr1->itile_hi_wp + hi * R;
-    const uint64_t *tlo2_m = pr2->itile_lo_wm + lo4 * R, *thi2_m = pr2->itile_hi_wm + hi * R, *thi2_p = pr2->itile_hi_wp + hi * R;
-
-    for (size_t j = 0; j < R; j++) {
-        __m512i base1 = ntt_mul_shoup52(_mm512_set1_epi64((long long)tlo1_m[j]), _mm512_set1_epi64((long long)thi1_m[j]), _mm512_set1_epi64((long long)thi1_p[j]), vP1, z);
-        __m512i w1 = ntt_mul_shoup52(base1, _mm512_load_si512((const __m512i *)(pr1->istep_wm8 + j*8)), _mm512_load_si512((const __m512i *)(pr1->istep_wp8 + j*8)), vP1, z);
-        _mm512_store_si512((__m512i *)(buf1 + j*8), ntt_mul_mont52(_mm512_load_si512((const __m512i *)(mat1 + j * stride + c0)), w1, vP1, vPinv1, z));
-
-        __m512i base2 = ntt_mul_shoup52(_mm512_set1_epi64((long long)tlo2_m[j]), _mm512_set1_epi64((long long)thi2_m[j]), _mm512_set1_epi64((long long)thi2_p[j]), vP2, z);
-        __m512i w2 = ntt_mul_shoup52(base2, _mm512_load_si512((const __m512i *)(pr2->istep_wm8 + j*8)), _mm512_load_si512((const __m512i *)(pr2->istep_wp8 + j*8)), vP2, z);
-        _mm512_store_si512((__m512i *)(buf2 + j*8), ntt_mul_mont52(_mm512_load_si512((const __m512i *)(mat2 + j * stride + c0)), w2, vP2, vPinv2, z));
+        __mmask8 neg = _mm512_movepi64_mask(d_signed);
+        _mm512_store_si512((__m512i *)(buf1 + dst_slot), _mm512_mask_add_epi64(d_signed, neg, d_signed, vP1));
+        _mm512_store_si512((__m512i *)(buf2 + dst_slot), _mm512_mask_add_epi64(d_signed, neg, d_signed, vP2));
     }
 
     size_t off = 0, half = 1;
@@ -2961,63 +2854,273 @@ XC_TARGET_IFMA_NTT static void ntt_col_idit_crt_pack_tile8(
         __m512i w2m = _mm512_set1_epi64((long long)pr2->rdit_wm[0]), w2p = _mm512_set1_epi64((long long)pr2->rdit_wp[0]);
         for (size_t base = 0; base < R; base += 2) {
             __m512i u1 = _mm512_load_si512((const __m512i *)(buf1 + base*8));
-            __m512i v1 = ntt_mul_shoup52(_mm512_load_si512((const __m512i *)(buf1 + (base+1)*8)), w1m, w1p, vP1, z);
-            _mm512_store_si512((__m512i *)(buf1 + base*8),     ntt_add_mod52(u1, v1, vP1));
-            _mm512_store_si512((__m512i *)(buf1 + (base+1)*8), ntt_sub_mod52(u1, v1, vP1));
+            __m512i v1 = ntt_mul_shoup_2p(_mm512_load_si512((const __m512i *)(buf1 + (base+1)*8)), w1m, w1p, vP1, z);
+            _mm512_store_si512((__m512i *)(buf1 + base*8),     ntt_add_2p(u1, v1, v2P1));
+            _mm512_store_si512((__m512i *)(buf1 + (base+1)*8), ntt_sub_2p(u1, v1, v2P1));
             __m512i u2 = _mm512_load_si512((const __m512i *)(buf2 + base*8));
-            __m512i v2 = ntt_mul_shoup52(_mm512_load_si512((const __m512i *)(buf2 + (base+1)*8)), w2m, w2p, vP2, z);
-            _mm512_store_si512((__m512i *)(buf2 + base*8),     ntt_add_mod52(u2, v2, vP2));
-            _mm512_store_si512((__m512i *)(buf2 + (base+1)*8), ntt_sub_mod52(u2, v2, vP2));
+            __m512i v2 = ntt_mul_shoup_2p(_mm512_load_si512((const __m512i *)(buf2 + (base+1)*8)), w2m, w2p, vP2, z);
+            _mm512_store_si512((__m512i *)(buf2 + base*8),     ntt_add_2p(u2, v2, v2P2));
+            _mm512_store_si512((__m512i *)(buf2 + (base+1)*8), ntt_sub_2p(u2, v2, v2P2));
         }
-        off = 1;
-        half = 2;
+        off = 1; half = 2;
     }
-    while (half < R) {
+    while (half < (R >> 2)) {
         size_t dbl = half << 1, step = half << 2;
-        const uint64_t *wm1_a = pr1->rdit_wm + off, *wp1_a = pr1->rdit_wp + off;
-        const uint64_t *wm1_b = pr1->rdit_wm + off + half, *wp1_b = pr1->rdit_wp + off + half;
-        const uint64_t *wm2_a = pr2->rdit_wm + off, *wp2_a = pr2->rdit_wp + off;
-        const uint64_t *wm2_b = pr2->rdit_wm + off + half, *wp2_b = pr2->rdit_wp + off + half;
-
+        const uint64_t *wm1_a = pr1->rdit_wm + off, *wp1_a = pr1->rdit_wp + off, *wm1_b = pr1->rdit_wm + off + half, *wp1_b = pr1->rdit_wp + off + half;
+        const uint64_t *wm2_a = pr2->rdit_wm + off, *wp2_a = pr2->rdit_wp + off, *wm2_b = pr2->rdit_wm + off + half, *wp2_b = pr2->rdit_wp + off + half;
         for (size_t base = 0; base < R; base += step) {
             for (size_t k = 0; k < half; k++) {
-                size_t i0 = (base + k) * 8, i1 = (base + half + k) * 8, i2 = (base + dbl + k) * 8, i3 = (base + dbl + half + k) * 8;
+                size_t i0 = (base+k)*8, i1 = (base+half+k)*8, i2 = (base+dbl+k)*8, i3 = (base+dbl+half+k)*8;
                 {
-                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf1 + i0)), x1 = _mm512_load_si512((const __m512i *)(buf1 + i1));
-                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf1 + i2)), x3 = _mm512_load_si512((const __m512i *)(buf1 + i3));
+                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf1+i0)), x1 = _mm512_load_si512((const __m512i *)(buf1+i1));
+                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf1+i2)), x3 = _mm512_load_si512((const __m512i *)(buf1+i3));
                     __m512i wam = _mm512_set1_epi64((long long)wm1_a[k]), wap = _mm512_set1_epi64((long long)wp1_a[k]);
-                    __m512i v1 = ntt_mul_shoup52(x1, wam, wap, vP1, z), v3 = ntt_mul_shoup52(x3, wam, wap, vP1, z);
-                    __m512i a0 = ntt_add_mod52(x0, v1, vP1), a1 = ntt_sub_mod52(x0, v1, vP1), a2 = ntt_add_mod52(x2, v3, vP1), a3 = ntt_sub_mod52(x2, v3, vP1);
-                    __m512i t2 = ntt_mul_shoup52(a2, _mm512_set1_epi64((long long)wm1_b[k]), _mm512_set1_epi64((long long)wp1_b[k]), vP1, z);
-                    __m512i t3 = ntt_mul_shoup52(a3, _mm512_set1_epi64((long long)wm1_b[half+k]), _mm512_set1_epi64((long long)wp1_b[half+k]), vP1, z);
-                    _mm512_store_si512((__m512i *)(buf1 + i0), ntt_add_mod52(a0, t2, vP1));
-                    _mm512_store_si512((__m512i *)(buf1 + i1), ntt_add_mod52(a1, t3, vP1));
-                    _mm512_store_si512((__m512i *)(buf1 + i2), ntt_sub_mod52(a0, t2, vP1));
-                    _mm512_store_si512((__m512i *)(buf1 + i3), ntt_sub_mod52(a1, t3, vP1));
+                    __m512i v1 = ntt_mul_shoup_2p(x1, wam, wap, vP1, z), v3 = ntt_mul_shoup_2p(x3, wam, wap, vP1, z);
+                    __m512i a0 = ntt_add_2p(x0, v1, v2P1), a1 = ntt_sub_2p(x0, v1, v2P1), a2 = ntt_add_2p(x2, v3, v2P1), a3 = ntt_sub_2p(x2, v3, v2P1);
+                    __m512i t2 = ntt_mul_shoup_2p(a2, _mm512_set1_epi64((long long)wm1_b[k]), _mm512_set1_epi64((long long)wp1_b[k]), vP1, z);
+                    __m512i t3 = ntt_mul_shoup_2p(a3, _mm512_set1_epi64((long long)wm1_b[half+k]), _mm512_set1_epi64((long long)wp1_b[half+k]), vP1, z);
+                    _mm512_store_si512((__m512i *)(buf1+i0), ntt_add_2p(a0, t2, v2P1));
+                    _mm512_store_si512((__m512i *)(buf1+i1), ntt_add_2p(a1, t3, v2P1));
+                    _mm512_store_si512((__m512i *)(buf1+i2), ntt_sub_2p(a0, t2, v2P1));
+                    _mm512_store_si512((__m512i *)(buf1+i3), ntt_sub_2p(a1, t3, v2P1));
                 }
                 {
-                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf2 + i0)), x1 = _mm512_load_si512((const __m512i *)(buf2 + i1));
-                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf2 + i2)), x3 = _mm512_load_si512((const __m512i *)(buf2 + i3));
+                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf2+i0)), x1 = _mm512_load_si512((const __m512i *)(buf2+i1));
+                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf2+i2)), x3 = _mm512_load_si512((const __m512i *)(buf2+i3));
                     __m512i wam = _mm512_set1_epi64((long long)wm2_a[k]), wap = _mm512_set1_epi64((long long)wp2_a[k]);
-                    __m512i v1 = ntt_mul_shoup52(x1, wam, wap, vP2, z), v3 = ntt_mul_shoup52(x3, wam, wap, vP2, z);
-                    __m512i a0 = ntt_add_mod52(x0, v1, vP2), a1 = ntt_sub_mod52(x0, v1, vP2), a2 = ntt_add_mod52(x2, v3, vP2), a3 = ntt_sub_mod52(x2, v3, vP2);
-                    __m512i t2 = ntt_mul_shoup52(a2, _mm512_set1_epi64((long long)wm2_b[k]), _mm512_set1_epi64((long long)wp2_b[k]), vP2, z);
-                    __m512i t3 = ntt_mul_shoup52(a3, _mm512_set1_epi64((long long)wm2_b[half+k]), _mm512_set1_epi64((long long)wp2_b[half+k]), vP2, z);
-                    _mm512_store_si512((__m512i *)(buf2 + i0), ntt_add_mod52(a0, t2, vP2));
-                    _mm512_store_si512((__m512i *)(buf2 + i1), ntt_add_mod52(a1, t3, vP2));
-                    _mm512_store_si512((__m512i *)(buf2 + i2), ntt_sub_mod52(a0, t2, vP2));
-                    _mm512_store_si512((__m512i *)(buf2 + i3), ntt_sub_mod52(a1, t3, vP2));
+                    __m512i v1 = ntt_mul_shoup_2p(x1, wam, wap, vP2, z), v3 = ntt_mul_shoup_2p(x3, wam, wap, vP2, z);
+                    __m512i a0 = ntt_add_2p(x0, v1, v2P2), a1 = ntt_sub_2p(x0, v1, v2P2), a2 = ntt_add_2p(x2, v3, v2P2), a3 = ntt_sub_2p(x2, v3, v2P2);
+                    __m512i t2 = ntt_mul_shoup_2p(a2, _mm512_set1_epi64((long long)wm2_b[k]), _mm512_set1_epi64((long long)wp2_b[k]), vP2, z);
+                    __m512i t3 = ntt_mul_shoup_2p(a3, _mm512_set1_epi64((long long)wm2_b[half+k]), _mm512_set1_epi64((long long)wp2_b[half+k]), vP2, z);
+                    _mm512_store_si512((__m512i *)(buf2+i0), ntt_add_2p(a0, t2, v2P2));
+                    _mm512_store_si512((__m512i *)(buf2+i1), ntt_add_2p(a1, t3, v2P2));
+                    _mm512_store_si512((__m512i *)(buf2+i2), ntt_sub_2p(a0, t2, v2P2));
+                    _mm512_store_si512((__m512i *)(buf2+i3), ntt_sub_2p(a1, t3, v2P2));
                 }
             }
         }
-        off += half + dbl;
-        half <<= 2;
+        off += half + dbl; half <<= 2;
     }
 
-    const __m512i vR2_1   = _mm512_set1_epi64((long long)pr1->r2_mod_p);
-    const __m512i vR2_2   = _mm512_set1_epi64((long long)pr2->r2_mod_p);
-    const __m512i vInv_wm = _mm512_set1_epi64((long long)invP1_wm);
-    const __m512i vInv_wp = _mm512_set1_epi64((long long)invP1_wp);
+    /* Fuse final DIT radix-4 stage (half = R >> 2) with 4-way parallel Four-Step twiddle + NT transpose stream! */
+    uint64_t b1_m = ntt_to_mont(ntt_mod_pow(pr1->wN, c0, pr1->P), pr1->P);
+    uint64_t b2_m = ntt_to_mont(ntt_mod_pow(pr2->wN, c0, pr2->P), pr2->P);
+    __m512i st1_raw = ntt_mul_shoup_2p(_mm512_set1_epi64((long long)b1_m),
+                        _mm512_load_si512((const __m512i *)pr1->pow8_wN_m),
+                        _mm512_load_si512((const __m512i *)pr1->pow8_wN_p), vP1, z);
+    __m512i st1_m = _mm512_min_epu64(st1_raw, _mm512_sub_epi64(st1_raw, vP1));
+    __m512i st1_p = _mm512_madd52lo_epu64(z, st1_m, vPinv1);
+
+    __m512i st2_raw = ntt_mul_shoup_2p(_mm512_set1_epi64((long long)b2_m),
+                        _mm512_load_si512((const __m512i *)pr2->pow8_wN_m),
+                        _mm512_load_si512((const __m512i *)pr2->pow8_wN_p), vP2, z);
+    __m512i st2_m = _mm512_min_epu64(st2_raw, _mm512_sub_epi64(st2_raw, vP2));
+    __m512i st2_p = _mm512_madd52lo_epu64(z, st2_m, vPinv2);
+
+    __m512i q1 = st1_m, q2 = st2_m;
+    for (int b = 0; b + 2 < pr1->logR; b++) {
+        q1 = ntt_mul_mont_2p(q1, q1, vP1, v2P1, vPinv1, z);
+        q2 = ntt_mul_mont_2p(q2, q2, vP2, v2P2, vPinv2, z);
+    }
+    __m512i c1_0 = _mm512_set1_epi64((long long)pr1->one_mont), c1_1 = q1;
+    __m512i c1_2 = ntt_mul_mont_2p(q1, q1, vP1, v2P1, vPinv1, z), c1_3 = ntt_mul_mont_2p(c1_2, q1, vP1, v2P1, vPinv1, z);
+    __m512i c2_0 = _mm512_set1_epi64((long long)pr2->one_mont), c2_1 = q2;
+    __m512i c2_2 = ntt_mul_mont_2p(q2, q2, vP2, v2P2, vPinv2, z), c2_3 = ntt_mul_mont_2p(c2_2, q2, vP2, v2P2, vPinv2, z);
+
+    {
+        const size_t qtr = R >> 2, dbl = R >> 1, tqtr = qtr + dbl;
+        const uint64_t *wm1_a = pr1->rdit_wm + off, *wp1_a = pr1->rdit_wp + off, *wm1_b = pr1->rdit_wm + off + qtr, *wp1_b = pr1->rdit_wp + off + qtr;
+        const uint64_t *wm2_a = pr2->rdit_wm + off, *wp2_a = pr2->rdit_wp + off, *wm2_b = pr2->rdit_wm + off + qtr, *wp2_b = pr2->rdit_wp + off + qtr;
+        int stream = (R * C * 8 >= (32ULL << 20));
+        for (size_t k = 0; k < qtr; k++) {
+            size_t i0 = k*8, i1 = (qtr+k)*8, i2 = (dbl+k)*8, i3 = (tqtr+k)*8;
+            __m512i y1_0, y1_1, y1_2, y1_3, y2_0, y2_1, y2_2, y2_3;
+            {
+                __m512i x0 = _mm512_load_si512((const __m512i *)(buf1+i0)), x1 = _mm512_load_si512((const __m512i *)(buf1+i1));
+                __m512i x2 = _mm512_load_si512((const __m512i *)(buf1+i2)), x3 = _mm512_load_si512((const __m512i *)(buf1+i3));
+                __m512i wam = _mm512_set1_epi64((long long)wm1_a[k]), wap = _mm512_set1_epi64((long long)wp1_a[k]);
+                __m512i v1 = ntt_mul_shoup_2p(x1, wam, wap, vP1, z), v3 = ntt_mul_shoup_2p(x3, wam, wap, vP1, z);
+                __m512i a0 = ntt_add_2p(x0, v1, v2P1), a1 = ntt_sub_2p(x0, v1, v2P1), a2 = ntt_add_2p(x2, v3, v2P1), a3 = ntt_sub_2p(x2, v3, v2P1);
+                __m512i t2 = ntt_mul_shoup_2p(a2, _mm512_set1_epi64((long long)wm1_b[k]), _mm512_set1_epi64((long long)wp1_b[k]), vP1, z);
+                __m512i t3 = ntt_mul_shoup_2p(a3, _mm512_set1_epi64((long long)wm1_b[qtr+k]), _mm512_set1_epi64((long long)wp1_b[qtr+k]), vP1, z);
+                y1_0 = ntt_mul_mont_2p(ntt_add_2p(a0, t2, v2P1), c1_0, vP1, v2P1, vPinv1, z);
+                y1_1 = ntt_mul_mont_2p(ntt_add_2p(a1, t3, v2P1), c1_1, vP1, v2P1, vPinv1, z);
+                y1_2 = ntt_mul_mont_2p(ntt_sub_2p(a0, t2, v2P1), c1_2, vP1, v2P1, vPinv1, z);
+                y1_3 = ntt_mul_mont_2p(ntt_sub_2p(a1, t3, v2P1), c1_3, vP1, v2P1, vPinv1, z);
+                c1_0 = ntt_mul_shoup_2p(c1_0, st1_m, st1_p, vP1, z); c1_1 = ntt_mul_shoup_2p(c1_1, st1_m, st1_p, vP1, z);
+                c1_2 = ntt_mul_shoup_2p(c1_2, st1_m, st1_p, vP1, z); c1_3 = ntt_mul_shoup_2p(c1_3, st1_m, st1_p, vP1, z);
+            }
+            {
+                __m512i x0 = _mm512_load_si512((const __m512i *)(buf2+i0)), x1 = _mm512_load_si512((const __m512i *)(buf2+i1));
+                __m512i x2 = _mm512_load_si512((const __m512i *)(buf2+i2)), x3 = _mm512_load_si512((const __m512i *)(buf2+i3));
+                __m512i wam = _mm512_set1_epi64((long long)wm2_a[k]), wap = _mm512_set1_epi64((long long)wp2_a[k]);
+                __m512i v1 = ntt_mul_shoup_2p(x1, wam, wap, vP2, z), v3 = ntt_mul_shoup_2p(x3, wam, wap, vP2, z);
+                __m512i a0 = ntt_add_2p(x0, v1, v2P2), a1 = ntt_sub_2p(x0, v1, v2P2), a2 = ntt_add_2p(x2, v3, v2P2), a3 = ntt_sub_2p(x2, v3, v2P2);
+                __m512i t2 = ntt_mul_shoup_2p(a2, _mm512_set1_epi64((long long)wm2_b[k]), _mm512_set1_epi64((long long)wp2_b[k]), vP2, z);
+                __m512i t3 = ntt_mul_shoup_2p(a3, _mm512_set1_epi64((long long)wm2_b[qtr+k]), _mm512_set1_epi64((long long)wp2_b[qtr+k]), vP2, z);
+                y2_0 = ntt_mul_mont_2p(ntt_add_2p(a0, t2, v2P2), c2_0, vP2, v2P2, vPinv2, z);
+                y2_1 = ntt_mul_mont_2p(ntt_add_2p(a1, t3, v2P2), c2_1, vP2, v2P2, vPinv2, z);
+                y2_2 = ntt_mul_mont_2p(ntt_sub_2p(a0, t2, v2P2), c2_2, vP2, v2P2, vPinv2, z);
+                y2_3 = ntt_mul_mont_2p(ntt_sub_2p(a1, t3, v2P2), c2_3, vP2, v2P2, vPinv2, z);
+                c2_0 = ntt_mul_shoup_2p(c2_0, st2_m, st2_p, vP2, z); c2_1 = ntt_mul_shoup_2p(c2_1, st2_m, st2_p, vP2, z);
+                c2_2 = ntt_mul_shoup_2p(c2_2, st2_m, st2_p, vP2, z); c2_3 = ntt_mul_shoup_2p(c2_3, st2_m, st2_p, vP2, z);
+            }
+            if (stream) {
+                _mm512_stream_si512((__m512i *)(mat1 + k*stride + c0),      y1_0);
+                _mm512_stream_si512((__m512i *)(mat1 + (qtr+k)*stride + c0),  y1_1);
+                _mm512_stream_si512((__m512i *)(mat1 + (dbl+k)*stride + c0),  y1_2);
+                _mm512_stream_si512((__m512i *)(mat1 + (tqtr+k)*stride + c0), y1_3);
+                _mm512_stream_si512((__m512i *)(mat2 + k*stride + c0),      y2_0);
+                _mm512_stream_si512((__m512i *)(mat2 + (qtr+k)*stride + c0),  y2_1);
+                _mm512_stream_si512((__m512i *)(mat2 + (dbl+k)*stride + c0),  y2_2);
+                _mm512_stream_si512((__m512i *)(mat2 + (tqtr+k)*stride + c0), y2_3);
+            } else {
+                _mm512_store_si512((__m512i *)(mat1 + k*stride + c0),      y1_0);
+                _mm512_store_si512((__m512i *)(mat1 + (qtr+k)*stride + c0),  y1_1);
+                _mm512_store_si512((__m512i *)(mat1 + (dbl+k)*stride + c0),  y1_2);
+                _mm512_store_si512((__m512i *)(mat1 + (tqtr+k)*stride + c0), y1_3);
+                _mm512_store_si512((__m512i *)(mat2 + k*stride + c0),      y2_0);
+                _mm512_store_si512((__m512i *)(mat2 + (qtr+k)*stride + c0),  y2_1);
+                _mm512_store_si512((__m512i *)(mat2 + (dbl+k)*stride + c0),  y2_2);
+                _mm512_store_si512((__m512i *)(mat2 + (tqtr+k)*stride + c0), y2_3);
+            }
+        }
+    }
+}
+
+XC_TARGET_IFMA_NTT static void ntt_col_idif_crt_pack_tile8(
+    const uint64_t * restrict mat1, const uint64_t * restrict mat2, size_t stride,
+    uint64_t * restrict c_out, size_t out_u64, int64_t * restrict blk_carries, const uint16_t * restrict brevR,
+    size_t tile8, uint64_t * restrict buf1, uint64_t * restrict buf2,
+    const xc_ntt_prime_t *pr1, const xc_ntt_prime_t *pr2,
+    uint64_t invP1_wm, uint64_t invP1_wp)
+{
+    const size_t R = pr1->R, n_tiles8 = pr1->C / 8, c0 = tile8 * 8;
+    const __m512i vP1 = _mm512_set1_epi64((long long)pr1->P), v2P1 = _mm512_set1_epi64((long long)pr1->twoP), vPinv1 = _mm512_set1_epi64((long long)pr1->pinv52);
+    const __m512i vP2 = _mm512_set1_epi64((long long)pr2->P), v2P2 = _mm512_set1_epi64((long long)pr2->twoP), vPinv2 = _mm512_set1_epi64((long long)pr2->pinv52);
+    const __m512i z   = _mm512_setzero_si512();
+
+    uint64_t ib1_m = ntt_to_mont(ntt_mod_pow(pr1->iwN, c0, pr1->P), pr1->P);
+    uint64_t ib2_m = ntt_to_mont(ntt_mod_pow(pr2->iwN, c0, pr2->P), pr2->P);
+    __m512i ist1_raw = ntt_mul_shoup_2p(_mm512_set1_epi64((long long)ib1_m),
+                         _mm512_load_si512((const __m512i *)pr1->pow8_iwN_m),
+                         _mm512_load_si512((const __m512i *)pr1->pow8_iwN_p), vP1, z);
+    __m512i ist1_m = _mm512_min_epu64(ist1_raw, _mm512_sub_epi64(ist1_raw, vP1));
+    __m512i ist1_p = _mm512_madd52lo_epu64(z, ist1_m, vPinv1);
+
+    __m512i ist2_raw = ntt_mul_shoup_2p(_mm512_set1_epi64((long long)ib2_m),
+                         _mm512_load_si512((const __m512i *)pr2->pow8_iwN_m),
+                         _mm512_load_si512((const __m512i *)pr2->pow8_iwN_p), vP2, z);
+    __m512i ist2_m = _mm512_min_epu64(ist2_raw, _mm512_sub_epi64(ist2_raw, vP2));
+    __m512i ist2_p = _mm512_madd52lo_epu64(z, ist2_m, vPinv2);
+
+    __m512i iq1 = ist1_m, iq2 = ist2_m;
+    for (int b = 0; b + 2 < pr1->logR; b++) {
+        iq1 = ntt_mul_mont_2p(iq1, iq1, vP1, v2P1, vPinv1, z);
+        iq2 = ntt_mul_mont_2p(iq2, iq2, vP2, v2P2, vPinv2, z);
+    }
+    __m512i c1_0 = _mm512_set1_epi64((long long)ntt_to_mont(ntt_to_mont(pr1->invN, pr1->P), pr1->P));
+    __m512i c1_1 = ntt_mul_mont_2p(c1_0, iq1, vP1, v2P1, vPinv1, z);
+    __m512i c1_2 = ntt_mul_mont_2p(c1_1, iq1, vP1, v2P1, vPinv1, z);
+    __m512i c1_3 = ntt_mul_mont_2p(c1_2, iq1, vP1, v2P1, vPinv1, z);
+    __m512i c2_0 = _mm512_set1_epi64((long long)ntt_to_mont(ntt_to_mont(pr2->invN, pr2->P), pr2->P));
+    __m512i c2_1 = ntt_mul_mont_2p(c2_0, iq2, vP2, v2P2, vPinv2, z);
+    __m512i c2_2 = ntt_mul_mont_2p(c2_1, iq2, vP2, v2P2, vPinv2, z);
+    __m512i c2_3 = ntt_mul_mont_2p(c2_2, iq2, vP2, v2P2, vPinv2, z);
+
+    /* Fuse first IDIF radix-4 stage (half = R >> 1) directly with matrix transpose read + 4-way twiddle! */
+    size_t off = 0, half = R >> 1;
+    {
+        const size_t qtr = R >> 2, tqtr = half + qtr;
+        const uint64_t *wm1_a = pr1->rdif_wm, *wp1_a = pr1->rdif_wp, *wm1_b = pr1->rdif_wm + half, *wp1_b = pr1->rdif_wp + half;
+        const uint64_t *wm2_a = pr2->rdif_wm, *wp2_a = pr2->rdif_wp, *wm2_b = pr2->rdif_wm + half, *wp2_b = pr2->rdif_wp + half;
+        for (size_t k = 0; k < qtr; k++) {
+            size_t i0 = k*8, i1 = (qtr+k)*8, i2 = (half+k)*8, i3 = (tqtr+k)*8;
+            {
+                __m512i x0 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat1 + k*stride + c0)),      c1_0, vP1, v2P1, vPinv1, z);
+                __m512i x1 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat1 + (qtr+k)*stride + c0)),  c1_1, vP1, v2P1, vPinv1, z);
+                __m512i x2 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat1 + (half+k)*stride + c0)), c1_2, vP1, v2P1, vPinv1, z);
+                __m512i x3 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat1 + (tqtr+k)*stride + c0)), c1_3, vP1, v2P1, vPinv1, z);
+                c1_0 = ntt_mul_shoup_2p(c1_0, ist1_m, ist1_p, vP1, z); c1_1 = ntt_mul_shoup_2p(c1_1, ist1_m, ist1_p, vP1, z);
+                c1_2 = ntt_mul_shoup_2p(c1_2, ist1_m, ist1_p, vP1, z); c1_3 = ntt_mul_shoup_2p(c1_3, ist1_m, ist1_p, vP1, z);
+                __m512i a0 = ntt_add_2p(x0, x2, v2P1), a1 = ntt_add_2p(x1, x3, v2P1);
+                __m512i a2 = ntt_mul_shoup_2p(ntt_sub_2p(x0, x2, v2P1), _mm512_set1_epi64((long long)wm1_a[k]), _mm512_set1_epi64((long long)wp1_a[k]), vP1, z);
+                __m512i a3 = ntt_mul_shoup_2p(ntt_sub_2p(x1, x3, v2P1), _mm512_set1_epi64((long long)wm1_a[qtr+k]), _mm512_set1_epi64((long long)wp1_a[qtr+k]), vP1, z);
+                __m512i wbm = _mm512_set1_epi64((long long)wm1_b[k]), wbp = _mm512_set1_epi64((long long)wp1_b[k]);
+                _mm512_store_si512((__m512i *)(buf1+i0), ntt_add_2p(a0, a1, v2P1));
+                _mm512_store_si512((__m512i *)(buf1+i1), ntt_mul_shoup_2p(ntt_sub_2p(a0, a1, v2P1), wbm, wbp, vP1, z));
+                _mm512_store_si512((__m512i *)(buf1+i2), ntt_add_2p(a2, a3, v2P1));
+                _mm512_store_si512((__m512i *)(buf1+i3), ntt_mul_shoup_2p(ntt_sub_2p(a2, a3, v2P1), wbm, wbp, vP1, z));
+            }
+            {
+                __m512i x0 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat2 + k*stride + c0)),      c2_0, vP2, v2P2, vPinv2, z);
+                __m512i x1 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat2 + (qtr+k)*stride + c0)),  c2_1, vP2, v2P2, vPinv2, z);
+                __m512i x2 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat2 + (half+k)*stride + c0)), c2_2, vP2, v2P2, vPinv2, z);
+                __m512i x3 = ntt_mul_mont_2p(_mm512_load_si512((const __m512i *)(mat2 + (tqtr+k)*stride + c0)), c2_3, vP2, v2P2, vPinv2, z);
+                c2_0 = ntt_mul_shoup_2p(c2_0, ist2_m, ist2_p, vP2, z); c2_1 = ntt_mul_shoup_2p(c2_1, ist2_m, ist2_p, vP2, z);
+                c2_2 = ntt_mul_shoup_2p(c2_2, ist2_m, ist2_p, vP2, z); c2_3 = ntt_mul_shoup_2p(c2_3, ist2_m, ist2_p, vP2, z);
+                __m512i a0 = ntt_add_2p(x0, x2, v2P2), a1 = ntt_add_2p(x1, x3, v2P2);
+                __m512i a2 = ntt_mul_shoup_2p(ntt_sub_2p(x0, x2, v2P2), _mm512_set1_epi64((long long)wm2_a[k]), _mm512_set1_epi64((long long)wp2_a[k]), vP2, z);
+                __m512i a3 = ntt_mul_shoup_2p(ntt_sub_2p(x1, x3, v2P2), _mm512_set1_epi64((long long)wm2_a[qtr+k]), _mm512_set1_epi64((long long)wp2_a[qtr+k]), vP2, z);
+                __m512i wbm = _mm512_set1_epi64((long long)wm2_b[k]), wbp = _mm512_set1_epi64((long long)wp2_b[k]);
+                _mm512_store_si512((__m512i *)(buf2+i0), ntt_add_2p(a0, a1, v2P2));
+                _mm512_store_si512((__m512i *)(buf2+i1), ntt_mul_shoup_2p(ntt_sub_2p(a0, a1, v2P2), wbm, wbp, vP2, z));
+                _mm512_store_si512((__m512i *)(buf2+i2), ntt_add_2p(a2, a3, v2P2));
+                _mm512_store_si512((__m512i *)(buf2+i3), ntt_mul_shoup_2p(ntt_sub_2p(a2, a3, v2P2), wbm, wbp, vP2, z));
+            }
+        }
+        off += half + qtr; half >>= 2;
+    }
+    while (half >= 2) {
+        size_t qtr = half >> 1, step = half << 1;
+        const uint64_t *wm1_a = pr1->rdif_wm + off, *wp1_a = pr1->rdif_wp + off, *wm1_b = pr1->rdif_wm + off + half, *wp1_b = pr1->rdif_wp + off + half;
+        const uint64_t *wm2_a = pr2->rdif_wm + off, *wp2_a = pr2->rdif_wp + off, *wm2_b = pr2->rdif_wm + off + half, *wp2_b = pr2->rdif_wp + off + half;
+        for (size_t base = 0; base < R; base += step) {
+            for (size_t k = 0; k < qtr; k++) {
+                size_t i0 = (base+k)*8, i1 = (base+qtr+k)*8, i2 = (base+half+k)*8, i3 = (base+half+qtr+k)*8;
+                {
+                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf1+i0)), x1 = _mm512_load_si512((const __m512i *)(buf1+i1));
+                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf1+i2)), x3 = _mm512_load_si512((const __m512i *)(buf1+i3));
+                    __m512i a0 = ntt_add_2p(x0, x2, v2P1), a1 = ntt_add_2p(x1, x3, v2P1);
+                    __m512i a2 = ntt_mul_shoup_2p(ntt_sub_2p(x0, x2, v2P1), _mm512_set1_epi64((long long)wm1_a[k]), _mm512_set1_epi64((long long)wp1_a[k]), vP1, z);
+                    __m512i a3 = ntt_mul_shoup_2p(ntt_sub_2p(x1, x3, v2P1), _mm512_set1_epi64((long long)wm1_a[qtr+k]), _mm512_set1_epi64((long long)wp1_a[qtr+k]), vP1, z);
+                    __m512i wbm = _mm512_set1_epi64((long long)wm1_b[k]), wbp = _mm512_set1_epi64((long long)wp1_b[k]);
+                    _mm512_store_si512((__m512i *)(buf1+i0), ntt_add_2p(a0, a1, v2P1));
+                    _mm512_store_si512((__m512i *)(buf1+i1), ntt_mul_shoup_2p(ntt_sub_2p(a0, a1, v2P1), wbm, wbp, vP1, z));
+                    _mm512_store_si512((__m512i *)(buf1+i2), ntt_add_2p(a2, a3, v2P1));
+                    _mm512_store_si512((__m512i *)(buf1+i3), ntt_mul_shoup_2p(ntt_sub_2p(a2, a3, v2P1), wbm, wbp, vP1, z));
+                }
+                {
+                    __m512i x0 = _mm512_load_si512((const __m512i *)(buf2+i0)), x1 = _mm512_load_si512((const __m512i *)(buf2+i1));
+                    __m512i x2 = _mm512_load_si512((const __m512i *)(buf2+i2)), x3 = _mm512_load_si512((const __m512i *)(buf2+i3));
+                    __m512i a0 = ntt_add_2p(x0, x2, v2P2), a1 = ntt_add_2p(x1, x3, v2P2);
+                    __m512i a2 = ntt_mul_shoup_2p(ntt_sub_2p(x0, x2, v2P2), _mm512_set1_epi64((long long)wm2_a[k]), _mm512_set1_epi64((long long)wp2_a[k]), vP2, z);
+                    __m512i a3 = ntt_mul_shoup_2p(ntt_sub_2p(x1, x3, v2P2), _mm512_set1_epi64((long long)wm2_a[qtr+k]), _mm512_set1_epi64((long long)wp2_a[qtr+k]), vP2, z);
+                    __m512i wbm = _mm512_set1_epi64((long long)wm2_b[k]), wbp = _mm512_set1_epi64((long long)wp2_b[k]);
+                    _mm512_store_si512((__m512i *)(buf2+i0), ntt_add_2p(a0, a1, v2P2));
+                    _mm512_store_si512((__m512i *)(buf2+i1), ntt_mul_shoup_2p(ntt_sub_2p(a0, a1, v2P2), wbm, wbp, vP2, z));
+                    _mm512_store_si512((__m512i *)(buf2+i2), ntt_add_2p(a2, a3, v2P2));
+                    _mm512_store_si512((__m512i *)(buf2+i3), ntt_mul_shoup_2p(ntt_sub_2p(a2, a3, v2P2), wbm, wbp, vP2, z));
+                }
+            }
+        }
+        off += half + qtr; half >>= 2;
+    }
+    if (half == 1) {
+        __m512i w1m = _mm512_set1_epi64((long long)pr1->rdif_wm[off]), w1p = _mm512_set1_epi64((long long)pr1->rdif_wp[off]);
+        __m512i w2m = _mm512_set1_epi64((long long)pr2->rdif_wm[off]), w2p = _mm512_set1_epi64((long long)pr2->rdif_wp[off]);
+        for (size_t base = 0; base < R; base += 2) {
+            __m512i u1 = _mm512_load_si512((const __m512i *)(buf1+base*8)), v1 = _mm512_load_si512((const __m512i *)(buf1+(base+1)*8));
+            _mm512_store_si512((__m512i *)(buf1+base*8),     ntt_add_2p(u1, v1, v2P1));
+            _mm512_store_si512((__m512i *)(buf1+(base+1)*8), ntt_mul_shoup_2p(ntt_sub_2p(u1, v1, v2P1), w1m, w1p, vP1, z));
+            __m512i u2 = _mm512_load_si512((const __m512i *)(buf2+base*8)), v2 = _mm512_load_si512((const __m512i *)(buf2+(base+1)*8));
+            _mm512_store_si512((__m512i *)(buf2+base*8),     ntt_add_2p(u2, v2, v2P2));
+            _mm512_store_si512((__m512i *)(buf2+(base+1)*8), ntt_mul_shoup_2p(ntt_sub_2p(u2, v2, v2P2), w2m, w2p, vP2, z));
+        }
+    }
+
+    const __m512i vInv_wm = _mm512_set1_epi64((long long)invP1_wm), vInv_wp = _mm512_set1_epi64((long long)invP1_wp);
+    const __m512i vHalfP2 = _mm512_set1_epi64((long long)(pr2->P >> 1));
     const __m512i vMask52 = _mm512_set1_epi64((long long)XC_NTT_MASK52);
     const uint64_t MASK40 = (1ULL << 40) - 1ULL;
     const __m512i vMask40 = _mm512_set1_epi64((long long)MASK40);
@@ -3030,26 +3133,48 @@ XC_TARGET_IFMA_NTT static void ntt_col_idit_crt_pack_tile8(
         size_t blk_id = r * n_tiles8 + tile8;
         size_t u64_off = blk_id * 5;
         if (u64_off >= out_u64) { blk_carries[blk_id] = 0; continue; }
+        size_t slot = (size_t)brevR[r] * 8;
 
-        __m512i r1 = ntt_mul_mont52(_mm512_load_si512((const __m512i *)(buf1 + r*8)), vR2_1, vP1, vPinv1, z);
-        __m512i r2 = ntt_mul_mont52(_mm512_load_si512((const __m512i *)(buf2 + r*8)), vR2_2, vP2, vPinv2, z);
+        __m512i r1_raw = _mm512_load_si512((const __m512i *)(buf1 + slot));
+        __m512i r2_raw = _mm512_load_si512((const __m512i *)(buf2 + slot));
+        __m512i r1 = _mm512_min_epu64(r1_raw, _mm512_sub_epi64(r1_raw, vP1));
+        __m512i r2 = _mm512_min_epu64(r2_raw, _mm512_sub_epi64(r2_raw, vP2));
+
         __m512i r1_m2 = _mm512_min_epu64(r1, _mm512_sub_epi64(r1, vP2));
-        __m512i k     = ntt_mul_shoup52(ntt_sub_mod52(r2, r1_m2, vP2), vInv_wm, vInv_wp, vP2, z);
+        __m512i k_raw = ntt_mul_shoup_2p(ntt_sub_2p(r2, r1_m2, v2P2), vInv_wm, vInv_wp, vP2, z);
+        __m512i k     = _mm512_min_epu64(k_raw, _mm512_sub_epi64(k_raw, vP2));
 
-        __m512i p_lo = _mm512_madd52lo_epu64(z, k, vP1);
-        __m512i p_hi = _mm512_madd52hi_epu64(z, k, vP1);
-        __m512i s_lo = _mm512_add_epi64(r1, p_lo);
-        __m512i s_hi = _mm512_add_epi64(p_hi, _mm512_srli_epi64(s_lo, 52));
-        s_lo = _mm512_and_epi64(s_lo, vMask52);
+        __mmask8 is_neg = _mm512_cmpgt_epu64_mask(k, vHalfP2);
+        __m512i k_abs = _mm512_mask_sub_epi64(k, is_neg, vP2, k);
+        __m512i p_lo  = _mm512_madd52lo_epu64(z, k_abs, vP1);
+        __m512i p_hi  = _mm512_madd52hi_epu64(z, k_abs, vP1);
 
-        _mm512_store_si512((__m512i *)sc_lo, _mm512_and_epi64(s_lo, vMask40));
-        _mm512_store_si512((__m512i *)sc_hi, _mm512_or_epi64(_mm512_srli_epi64(s_lo, 40), _mm512_slli_epi64(s_hi, 12)));
+        __m512i pos_lo = _mm512_add_epi64(r1, p_lo);
+        __m512i pos_hi = _mm512_add_epi64(p_hi, _mm512_srli_epi64(pos_lo, 52));
+        pos_lo = _mm512_and_epi64(pos_lo, vMask52);
 
-        uint64_t cy = 0;
+        __m512i neg_sub = _mm512_sub_epi64(p_lo, r1);
+        __m512i borrow  = _mm512_srli_epi64(neg_sub, 63);
+        __m512i mag_lo  = _mm512_and_epi64(neg_sub, vMask52);
+        __m512i mag_hi  = _mm512_sub_epi64(p_hi, borrow);
+
+        __m512i p_lo40 = _mm512_and_epi64(pos_lo, vMask40);
+        __m512i p_hi64 = _mm512_or_epi64(_mm512_srli_epi64(pos_lo, 40), _mm512_slli_epi64(pos_hi, 12));
+
+        __m512i m_lo40 = _mm512_and_epi64(mag_lo, vMask40);
+        __m512i m_hi64 = _mm512_or_epi64(_mm512_srli_epi64(mag_lo, 40), _mm512_slli_epi64(mag_hi, 12));
+        __mmask8 nz_mlo = _mm512_cmpneq_epi64_mask(m_lo40, z);
+        __m512i n_lo40 = _mm512_mask_sub_epi64(z, nz_mlo, _mm512_set1_epi64(1LL << 40), m_lo40);
+        __m512i n_hi64 = _mm512_sub_epi64(z, _mm512_mask_add_epi64(m_hi64, nz_mlo, m_hi64, _mm512_set1_epi64(1)));
+
+        _mm512_store_si512((__m512i *)sc_lo, _mm512_mask_blend_epi64(is_neg, p_lo40, n_lo40));
+        _mm512_store_si512((__m512i *)sc_hi, _mm512_mask_blend_epi64(is_neg, p_hi64, n_hi64));
+
+        int64_t cy = 0;
         for (int j = 0; j < 8; j++) {
-            uint64_t s = sc_lo[j] + (cy & MASK40);
-            sc_lo[j] = s & MASK40;
-            cy = sc_hi[j] + (cy >> 40) + (s >> 40);
+            int64_t s = (int64_t)sc_lo[j] + (cy & (int64_t)MASK40);
+            sc_lo[j] = (uint64_t)s & MASK40;
+            cy = (int64_t)sc_hi[j] + (cy >> 40) + (s >> 40);
         }
         blk_carries[blk_id] = cy;
 
@@ -3071,9 +3196,9 @@ XC_TARGET_IFMA_NTT static void ntt_col_idit_crt_pack_tile8(
 
 static inline void ntt_sfence(void) { _mm_sfence(); }
 
-static void ntt_resolve_block_carries(uint64_t * restrict c_out, size_t out_u64, const uint64_t * restrict blk_carries, int nt) {
+static void ntt_resolve_block_carries(uint64_t * restrict c_out, size_t out_u64, const int64_t * restrict blk_carries, int nt) {
     const size_t n_blks = (out_u64 + 4) / 5;
-    uint64_t thread_cy[64] = {0};
+    int64_t thread_cy[64] = {0};
 
     #pragma omp parallel num_threads(nt)
     {
@@ -3085,42 +3210,42 @@ static void ntt_resolve_block_carries(uint64_t * restrict c_out, size_t out_u64,
 #endif
         size_t beg = ((size_t)tid * n_blks) / (size_t)nthr;
         size_t end = ((size_t)(tid + 1) * n_blks) / (size_t)nthr;
-        uint64_t cy = 0;
+        __int128 cy = 0;
         size_t b = beg;
         for (; b + 1 < end && (b + 1) * 5 <= out_u64; b++) {
             uint64_t *p = c_out + b * 5;
-            __uint128_t s0 = (__uint128_t)p[0] + cy;
+            __int128 s0 = (__int128)p[0] + cy;
             p[0] = (uint64_t)s0;
-            uint64_t c = (uint64_t)(s0 >> 64);
+            __int128 c = s0 >> 64;
             if (__builtin_expect(c != 0, 0)) {
                 for (int k = 1; k < 5 && c != 0; k++) {
-                    __uint128_t sk = (__uint128_t)p[k] + c;
+                    __int128 sk = (__int128)p[k] + c;
                     p[k] = (uint64_t)sk;
-                    c = (uint64_t)(sk >> 64);
+                    c = sk >> 64;
                 }
             }
-            cy = blk_carries[b] + c;
+            cy = (__int128)blk_carries[b] + c;
         }
         for (; b < end; b++) {
             size_t u0 = b * 5;
-            for (size_t k = 0; k < 5 && u0 + k < out_u64 && cy > 0; k++) {
-                __uint128_t s = (__uint128_t)c_out[u0 + k] + cy;
+            for (size_t k = 0; k < 5 && u0 + k < out_u64 && cy != 0; k++) {
+                __int128 s = (__int128)c_out[u0 + k] + cy;
                 c_out[u0 + k] = (uint64_t)s;
-                cy = (uint64_t)(s >> 64);
+                cy = s >> 64;
             }
-            cy += blk_carries[b];
+            cy += (__int128)blk_carries[b];
         }
-        thread_cy[tid] = cy;
+        thread_cy[tid] = (int64_t)cy;
     }
 
     for (int tid = 0; tid < nt - 1; tid++) {
         size_t end = ((size_t)(tid + 1) * n_blks) / (size_t)nt;
         size_t u_idx = end * 5;
-        uint64_t cy = thread_cy[tid];
-        while (cy > 0 && u_idx < out_u64) {
-            __uint128_t s = (__uint128_t)c_out[u_idx] + cy;
+        __int128 cy = thread_cy[tid];
+        while (cy != 0 && u_idx < out_u64) {
+            __int128 s = (__int128)c_out[u_idx] + cy;
             c_out[u_idx] = (uint64_t)s;
-            cy = (uint64_t)(s >> 64);
+            cy = s >> 64;
             u_idx++;
         }
     }
@@ -3143,8 +3268,8 @@ static void ntt_exec_cold(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u64,
         int t, r;
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++) {
-            ntt_unpack_col_dif_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
-            ntt_unpack_col_dif_dual_tile8(eng->B1, eng->B2, eng->stride, (const uint8_t *)b, nb * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+            ntt_unpack_col_dit_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, eng->brevR, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+            ntt_unpack_col_dit_dual_tile8(eng->B1, eng->B2, eng->stride, (const uint8_t *)b, nb * 8, eng->brevR, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
         }
         ntt_sfence();
         #pragma omp for schedule(dynamic, 32)
@@ -3156,7 +3281,7 @@ static void ntt_exec_cold(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u64,
         }
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++) {
-            ntt_col_idit_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries,
+            ntt_col_idif_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries, eng->brevR,
                                         (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2, eng->invP1_wm, eng->invP1_wp);
         }
     }
@@ -3178,7 +3303,7 @@ static void ntt_exec_trunk_build(const xc_ntt_engine_t *eng, uint64_t *B1, uint6
         int t, r;
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++)
-            ntt_unpack_col_dif_dual_tile8(B1, B2, eng->stride, (const uint8_t *)b, nb * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+            ntt_unpack_col_dit_dual_tile8(B1, B2, eng->stride, (const uint8_t *)b, nb * 8, eng->brevR, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
         ntt_sfence();
         #pragma omp for schedule(dynamic, 32)
         for (r = 0; r < R_i; r++) {
@@ -3205,7 +3330,7 @@ static void ntt_exec_trunk_mul(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u
         int t, r;
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++)
-            ntt_unpack_col_dif_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+            ntt_unpack_col_dit_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, eng->brevR, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
         ntt_sfence();
         #pragma omp for schedule(dynamic, 32)
         for (r = 0; r < R_i; r++) {
@@ -3214,7 +3339,7 @@ static void ntt_exec_trunk_mul(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u
         }
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++)
-            ntt_col_idit_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries,
+            ntt_col_idif_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries, eng->brevR,
                                         (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2, eng->invP1_wm, eng->invP1_wp);
     }
     ntt_resolve_block_carries(out, out_u64, eng->blk_carries, nt);
@@ -3237,7 +3362,7 @@ static void ntt_exec_square(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u64,
         int t, r;
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++)
-            ntt_unpack_col_dif_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+            ntt_unpack_col_dit_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, eng->brevR, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
         ntt_sfence();
         #pragma omp for schedule(dynamic, 32)
         for (r = 0; r < R_i; r++) {
@@ -3246,7 +3371,7 @@ static void ntt_exec_square(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u64,
         }
         #pragma omp for schedule(dynamic, 8)
         for (t = 0; t < n_tiles8; t++)
-            ntt_col_idit_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries,
+            ntt_col_idif_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries, eng->brevR,
                                         (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2, eng->invP1_wm, eng->invP1_wp);
     }
     ntt_resolve_block_carries(out, out_u64, eng->blk_carries, nt);
@@ -3299,7 +3424,7 @@ static int should_use_ifma_ntt(size_t max_na, size_t max_nb, int *out_logN) {
     size_t need40 = la40 + lb40 + 16ULL;
     int logN = 10;
     while (logN < 28 && (1ULL << logN) < need40) logN++;
-    if (logN >= 17 && logN <= 25 && min_l40 <= 16777000ULL) {
+    if (logN >= 17 && logN <= 24 && min_l40 <= 8388500ULL) {
         *out_logN = logN;
         return 1;
     }
@@ -3370,7 +3495,7 @@ XC_API int xc_plan_mul(xc_plan_t *plan, uint64_t *out,
         size_t la40 = (na * 8ULL + 4ULL) / 5ULL;
         size_t lb40 = (nb * 8ULL + 4ULL) / 5ULL;
         size_t min_l40 = (la40 < lb40) ? la40 : lb40;
-        if (la40 + lb40 + 8ULL > plan->ntt->N || min_l40 > 16777000ULL) return XC_ERR_RANGE;
+        if (la40 + lb40 + 8ULL > plan->ntt->N || min_l40 > 8388500ULL) return XC_ERR_RANGE;
         size_t active_out = na + nb;
         if (orig_out > active_out) memset(out + active_out, 0, (orig_out - active_out) * sizeof(uint64_t));
         g_last_bits = 40;
@@ -3514,7 +3639,7 @@ XC_API int xc_mul_trunk(xc_plan_t *plan, uint64_t *out,
         size_t la40 = (na * 8ULL + 4ULL) / 5ULL;
         size_t lb40 = (b_trunk->active_nb * 8ULL + 4ULL) / 5ULL;
         size_t min_l40 = (la40 < lb40) ? la40 : lb40;
-        if (la40 + lb40 + 8ULL > plan->ntt->N || min_l40 > 16777000ULL) return XC_ERR_RANGE;
+        if (la40 + lb40 + 8ULL > plan->ntt->N || min_l40 > 8388500ULL) return XC_ERR_RANGE;
         size_t active_out = na + b_trunk->active_nb;
         if (orig_out > active_out) memset(out + active_out, 0, (orig_out - active_out) * sizeof(uint64_t));
         g_last_bits = 40;
@@ -3548,6 +3673,51 @@ XC_API int xc_mul_trunk(xc_plan_t *plan, uint64_t *out,
     return XC_OK;
 }
 
+static xc_plan_t *g_cached_wave_plan = NULL;
+
+static xc_plan_t *xc_wave_acquire_cached(int B, int log_c) {
+#if defined(__GNUC__) || defined(__clang__)
+    xc_plan_t *p = __atomic_exchange_n(&g_cached_wave_plan, NULL, __ATOMIC_ACQUIRE);
+#else
+    xc_plan_t *p = NULL;
+#endif
+    if (p && (p->limb_bits != B || p->log_c != log_c)) {
+        plan_free_internal(p);
+        free(p);
+        p = NULL;
+    }
+    if (!p) {
+        p = (xc_plan_t *)calloc(1, sizeof(xc_plan_t));
+        if (!p) return NULL;
+        if (plan_init_internal(p, B, log_c, 1) != XC_OK) {
+            plan_free_internal(p);
+            free(p);
+            return NULL;
+        }
+    }
+    return p;
+}
+
+static void xc_wave_release_cached(xc_plan_t *p) {
+    if (!p) return;
+#if defined(__GNUC__) || defined(__clang__)
+    if (p->log_c <= 14) {
+        xc_plan_t *prev = __atomic_exchange_n(&g_cached_wave_plan, p, __ATOMIC_ACQ_REL);
+        if (prev) { plan_free_internal(prev); free(prev); }
+        return;
+    }
+#endif
+    plan_free_internal(p);
+    free(p);
+}
+
+#if defined(__GNUC__) || defined(__clang__)
+__attribute__((destructor)) static void xc_wave_cleanup_cache_at_exit(void) {
+    xc_plan_t *p = __atomic_exchange_n(&g_cached_wave_plan, NULL, __ATOMIC_ACQUIRE);
+    if (p) { plan_free_internal(p); free(p); }
+}
+#endif
+
 XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
                       const uint64_t *b, size_t nb) {
     if (!out || (!a && na) || (!b && nb)) return XC_ERR_ARG;
@@ -3560,12 +3730,15 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
         return XC_OK;
     }
 
-    memset(out, 0, orig_out * sizeof(uint64_t));
+    size_t active_out = na + nb;
+    if (orig_out > active_out) {
+        memset(out + active_out, 0, (orig_out - active_out) * sizeof(uint64_t));
+    }
     size_t min_n = (na < nb) ? na : nb;
     size_t max_n = (na > nb) ? na : nb;
 
     /* 1) Register-scale Schoolbook */
-    if (min_n <= 40 || (na + nb) <= 64) {
+    if (min_n <= 40 || active_out <= 64) {
         schoolbook_mul_u64(out, a, na, b, nb);
         g_last_path = XC_PATH_SCHOOLBOOK;
         return XC_OK;
@@ -3573,7 +3746,7 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
 
     /* 2) L1-cache Karatsuba */
     if (max_n <= 384) {
-        size_t sc_words = 8 * (na + nb) + 256;
+        size_t sc_words = 8 * active_out + 256;
         uint64_t *scratch = (uint64_t *)malloc(sc_words * sizeof(uint64_t));
         if (!scratch) return XC_ERR_NOMEM;
         karatsuba_rec(out, a, na, b, nb, scratch);
@@ -3588,7 +3761,7 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
     }
 
 #if XC_HAS_X86_SIMD
-    /* 4) Shoup-Seiler 2-Prime 52-bit AVX-512 IFMA52 Exact Integer NTT (~400K .. 201M digits) */
+    /* 4) Shoup-Seiler 2-Prime 51-bit AVX-512 IFMA52 Exact Integer NTT (~400K .. 101M digits) */
     {
         int logN = 0;
         if (should_use_ifma_ntt(na, nb, &logN)) {
@@ -3596,8 +3769,8 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
             xc_ntt_engine_t *eng = xc_ntt_acquire_cached(logN, !is_sq);
             if (!eng) return XC_ERR_NOMEM;
             g_last_bits = 40;
-            if (is_sq) ntt_exec_square(eng, out, na + nb, a, na);
-            else       ntt_exec_cold(eng, out, na + nb, a, na, b, nb);
+            if (is_sq) ntt_exec_square(eng, out, active_out, a, na);
+            else       ntt_exec_cold(eng, out, active_out, a, na, b, nb);
             xc_ntt_release_cached(eng);
             g_last_path = XC_PATH_WAVE_COLD;
             return XC_OK;
@@ -3612,15 +3785,11 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
         return xc_mul_u64_lowmem(out, a, na, b, nb);
     }
 
-    /* 6) Crandall-Fagin Adaptive B-Bit Vedic Vinculum Wave Engine */
-    xc_plan_t plan;
-    memset(&plan, 0, sizeof(plan));
-    if (plan_init_internal(&plan, B, log_c, 1) != XC_OK) {
-        plan_free_internal(&plan);
-        return XC_ERR_NOMEM;
-    }
-    int rc = xc_plan_mul(&plan, out, a, na, b, nb);
-    plan_free_internal(&plan);
+    /* 6) Crandall-Fagin Adaptive B-Bit Vedic Vinculum Wave Engine (1-slot cached) */
+    xc_plan_t *plan = xc_wave_acquire_cached(B, log_c);
+    if (!plan) return XC_ERR_NOMEM;
+    int rc = xc_plan_mul(plan, out, a, na, b, nb);
+    xc_wave_release_cached(plan);
     return rc;
 }
 
