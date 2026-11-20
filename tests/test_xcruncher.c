@@ -184,10 +184,35 @@ int main(void) {
         int b_used = xc_last_limb_bits();
         /* Verify against Low-RAM Karatsuba (which uses smaller B=15/16 leaves) & spot-check ref_mul on 60K words */
         ref_mul(e2, a2, n2, a2, n2);
-        int ok2 = (b_used <= 14 && memcmp(g2, e2, 2 * n2 * 8) == 0);
+        int ok2 = ((b_used == 40 || b_used <= 14) && memcmp(g2, e2, 2 * n2 * 8) == 0);
         free(a2); free(g2); free(e2);
 
-        CHECK(ok1 && ok2, "Adversarial worst-case non-canceling Vedic limb saturation (1.15M digits, B=14) exact");
+        CHECK(ok1 && ok2, "Adversarial worst-case non-canceling saturation (1.15M digits, IFMA52-NTT / B=14) exact");
+    }
+
+    /* 6b. Large Plan + Trunk + Unbalanced + Adversarial All-0xFF (exercises 2-Prime IFMA52 NTT on Zen 4/Ice Lake+) */
+    {
+        const size_t na = 32000, nb = 28000;
+        uint64_t *a = (uint64_t *)malloc(na * 8), *b = (uint64_t *)malloc(nb * 8);
+        uint64_t *g_cold = (uint64_t *)malloc((na + nb) * 8);
+        uint64_t *g_tr   = (uint64_t *)malloc((na + nb) * 8);
+        uint64_t *exp    = (uint64_t *)malloc((na + nb) * 8);
+        /* Mix adversarial 0xFF runs with random limbs so Sparse NAF doesn't short-circuit */
+        for (size_t i = 0; i < na; i++) a[i] = (i & 3ULL) ? ~0ULL : xorshift64(&rng);
+        for (size_t i = 0; i < nb; i++) b[i] = (i & 3ULL) ? ~0ULL : xorshift64(&rng);
+
+        ref_mul(exp, a, na, b, nb);
+        xc_plan_t  *plan  = xc_plan_create(na, nb);
+        xc_trunk_t *trunk = xc_trunk_create(plan, b, nb);
+        int r_cd = xc_plan_mul(plan, g_cold, a, na, b, nb);
+        int r_tr = xc_mul_trunk(plan, g_tr, a, na, trunk);
+        int ok_ntt = (r_cd == XC_OK && r_tr == XC_OK &&
+                      memcmp(g_cold, exp, (na + nb) * 8) == 0 &&
+                      memcmp(g_tr,   exp, (na + nb) * 8) == 0);
+        xc_trunk_destroy(trunk);
+        xc_plan_destroy(plan);
+        free(a); free(b); free(g_cold); free(g_tr); free(exp);
+        CHECK(ok_ntt, "Large unbalanced Plan + Trunk (60K words, 2-Prime 52-bit IFMA52 NTT / Wave) exact");
     }
 
     /* 7. Decimal string multiplication */

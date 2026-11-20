@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.2.0"
+__version__ = "1.3.0"
 
 _LIB: Optional[ctypes.CDLL] = None
 

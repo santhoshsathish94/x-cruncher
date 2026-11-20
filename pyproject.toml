@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "x-cruncher"
-version = "1.2.0"
+version = "1.3.0"
 description = "y-cruncher-tier arbitrary-precision integer multiplication engine (16-bit Crandall-Fagin Vedic Wave + WaveTrunks + Sparse NAF)"
 readme = "README.md"
 license = {text = "MIT"}
