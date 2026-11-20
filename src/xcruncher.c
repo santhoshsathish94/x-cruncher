@@ -1265,14 +1265,10 @@ XC_TARGET_AVX2 static void avx2_sub_idit(double *row, size_t C, const double *su
     }
 }
 
-XC_TARGET_AVX2 static void pass2_convolve_avx2(const xc_plan_t *E, const double *Bz_src, int b_is_trunk) {
+XC_TARGET_AVX2 static void pass2_convolve_avx2_row(const xc_plan_t *E, const double *Bz_src, int b_is_trunk, int r_beg, int r_end) {
     const size_t C = E->C_SUB;
     const __m256d scale = _mm256_set1_pd(b_is_trunk ? 1.0 : (1.0 / (double)E->M));
-    int nt = xc_wave_threads(E->M);
-    int r;
-
-    #pragma omp parallel for num_threads(nt) schedule(static)
-    for (r = 0; r < 640; r++) {
+    for (int r = r_beg; r < r_end; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
         avx2_sub_dif(rowA, C, E->sub_re, E->sub_im);
@@ -1289,6 +1285,21 @@ XC_TARGET_AVX2 static void pass2_convolve_avx2(const xc_plan_t *E, const double 
             }
         }
         avx2_sub_idit(rowA, C, E->sub_re, E->sub_im);
+    }
+}
+
+static void pass2_convolve_avx2(const xc_plan_t *E, const double *Bz_src, int b_is_trunk) {
+    int nt = xc_wave_threads(E->M);
+    #pragma omp parallel num_threads(nt)
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num(), nthr = omp_get_num_threads();
+#else
+        int tid = 0, nthr = 1;
+#endif
+        int r_beg = (640 * tid) / nthr;
+        int r_end = (640 * (tid + 1)) / nthr;
+        pass2_convolve_avx2_row(E, Bz_src, b_is_trunk, r_beg, r_end);
     }
 }
 
