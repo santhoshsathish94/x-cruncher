@@ -454,11 +454,10 @@ static int try_vedic_sparse_mul(uint64_t *out, const uint64_t *a, size_t na,
     }
     qsort(ev, (size_t)m, sizeof(xc_prod_event_t), cmp_prod_event);
 
-    /* Single forward sweep across [0 .. out_n - 1] with signed 128-bit accumulator:
+    /* Single forward sweep across [0 .. out_n - 1] with portable 64-bit signed carry:
        Untouched word runs between events are filled in ONE memset(0x00 or 0xFF)! */
     size_t cur_w = 0;
-#if defined(__SIZEOF_INT128__)
-    __int128 carry = 0;
+    int64_t carry = 0;
     int idx = 0;
     while (idx < m) {
         size_t w = ev[idx].w_idx;
@@ -472,7 +471,7 @@ static int try_vedic_sparse_mul(uint64_t *out, const uint64_t *a, size_t na,
             } else {
                 while (cur_w < w && carry != 0 && carry != -1) {
                     out[cur_w++] = (uint64_t)carry;
-                    carry >>= 64;
+                    carry = (carry < 0) ? -1 : 0;
                 }
                 if (cur_w < w) {
                     memset(out + cur_w, (carry == -1) ? 0xFF : 0x00, (w - cur_w) * sizeof(uint64_t));
@@ -480,30 +479,28 @@ static int try_vedic_sparse_mul(uint64_t *out, const uint64_t *a, size_t na,
                 }
             }
         }
-        __int128 acc = carry;
-        /* Sum all events at word `w` using 2-word signed accumulation to prevent 128-bit overflow at bit 63 */
-        __int128 hi_extra = 0;
+        uint64_t lo = (uint64_t)carry;
+        int64_t  hi = (carry < 0) ? -1 : 0;
         while (idx < m && ev[idx].w_idx == w) {
             uint64_t bit = 1ULL << ev[idx].bit_off;
             if (ev[idx].sign > 0) {
-                __uint128_t u = (__uint128_t)bit;
-                acc += (__int128)u;
+                uint64_t s = lo + bit;
+                if (s < lo) hi++;
+                lo = s;
             } else {
-                __uint128_t u = (__uint128_t)bit;
-                acc -= (__int128)u;
+                uint64_t d = lo - bit;
+                if (d > lo) hi--;
+                lo = d;
             }
-            /* Rebalance into hi_extra every 32 terms so `acc` never nears 2^126 */
-            hi_extra += (acc >> 64);
-            acc = (__int128)(uint64_t)acc;
             idx++;
         }
-        out[w] = (uint64_t)acc;
-        carry  = hi_extra + (acc >> 64);
+        out[w] = lo;
+        carry  = hi;
         cur_w  = w + 1;
     }
     while (cur_w < out_n && carry != 0) {
         out[cur_w++] = (uint64_t)carry;
-        carry >>= 64;
+        carry = (carry < 0) ? -1 : 0;
     }
     if (cur_w < out_n) {
         memset(out + cur_w, 0x00, (out_n - cur_w) * sizeof(uint64_t));
@@ -511,10 +508,6 @@ static int try_vedic_sparse_mul(uint64_t *out, const uint64_t *a, size_t na,
     free(ev);
     g_last_path = XC_PATH_VEDIC_SPARSE;
     return 1;
-#else
-    free(ev);
-    return 0;
-#endif
 }
 
 /* =========================================================================================
@@ -625,8 +618,11 @@ static int plan_init_internal(xc_plan_t *E, int log_c, int alloc_bz) {
     }
 
     int nt = xc_wave_threads(E->M);
+    int n_pages = (int)((2 * E->M + 511) / 512);
+    int pg;
     #pragma omp parallel for num_threads(nt) schedule(static)
-    for (ptrdiff_t i = 0; i < (ptrdiff_t)(2 * E->M); i += 512) {
+    for (pg = 0; pg < n_pages; pg++) {
+        size_t i = (size_t)pg * 512;
         E->Az[i] = 0.0;
         if (E->Bz) E->Bz[i] = 0.0;
     }
@@ -911,8 +907,9 @@ static void pass1_single_scalar(const xc_plan_t *E, const uint16_t *A_u16, size_
     #pragma omp parallel num_threads(nt)
     {
         vec8d in_re[640], out_re[640], out_im[640];
+        int v, n_vec_i = (int)n_vec;
         #pragma omp for schedule(static)
-        for (ptrdiff_t v = 0; v < (ptrdiff_t)n_vec; v++) {
+        for (v = 0; v < n_vec_i; v++) {
             size_t b0 = (size_t)v * 8;
             for (int j = 0; j < n_nz; j++) sc_load_vedic8(A_u16, n_u16, (size_t)j * C + b0, &in_re[j]);
             sc_dft640_fwd_real(in_re, n_nz, out_re, out_im, E);
@@ -934,9 +931,10 @@ static void pass2_convolve_scalar(const xc_plan_t *E, const double *Bz_src, int 
     const size_t C = E->C_SUB;
     const double scale = b_is_trunk ? 1.0 : (1.0 / (double)E->M);
     int nt = xc_wave_threads(E->M);
+    int r;
 
     #pragma omp parallel for num_threads(nt) schedule(static)
-    for (int r = 0; r < 640; r++) {
+    for (r = 0; r < 640; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
         sc_sub_dif(rowA, C, E->sub_re, E->sub_im);
@@ -1009,8 +1007,9 @@ static void pass3_unpack_scalar(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
     #pragma omp parallel num_threads(nt)
     {
         vec8d in_re[640], in_im[640], out_re[640], out_im[640];
+        int v, n_vec_i = (int)n_vec;
         #pragma omp for schedule(static)
-        for (ptrdiff_t v = 0; v < (ptrdiff_t)n_vec; v++) {
+        for (v = 0; v < n_vec_i; v++) {
             size_t b0 = (size_t)v * 8;
             for (int r = 0; r < 640; r++) {
                 const double *src = E->Az + ((size_t)r * C + b0) * 2;
@@ -1184,9 +1183,10 @@ XC_TARGET_AVX2 static void pass2_convolve_avx2(const xc_plan_t *E, const double 
     const size_t C = E->C_SUB;
     const __m256d scale = _mm256_set1_pd(b_is_trunk ? 1.0 : (1.0 / (double)E->M));
     int nt = xc_wave_threads(E->M);
+    int r;
 
     #pragma omp parallel for num_threads(nt) schedule(static)
-    for (int r = 0; r < 640; r++) {
+    for (r = 0; r < 640; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
         avx2_sub_dif(rowA, C, E->sub_re, E->sub_im);
@@ -1741,9 +1741,10 @@ static void pass1_memo_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t 
     const size_t n_vec = E->C_SUB / 8;
     int nt = xc_wave_threads(E->M);
     double W_re[640][44], W_im[640][44];
+    int r;
 
     #pragma omp parallel for num_threads(nt) schedule(static)
-    for (int r = 0; r < 640; r++) {
+    for (r = 0; r < 640; r++) {
         for (int u = 0; u < U; u++) { W_re[r][u] = 0.0; W_im[r][u] = 0.0; }
         for (int j = 0; j < n_nz; j++) {
             int u = slice_uid[j], idx = (j * (4 * r + 1)) % 2560;
@@ -1786,15 +1787,16 @@ static int dispatch_pass1_auto_memo(const xc_plan_t *E, const uint16_t *A_u16, s
         int slice_uid[640], rep_j[640];
         uint64_t hashes[640];
         int nt = xc_wave_threads(E->M);
+        int j_omp;
 
         #pragma omp parallel for num_threads(nt) schedule(static)
-        for (int j = 0; j < n_full; j++) {
-            const uint64_t *p64 = (const uint64_t *)(A_u16 + (size_t)j * C);
+        for (j_omp = 0; j_omp < n_full; j_omp++) {
+            const uint64_t *p64 = (const uint64_t *)(A_u16 + (size_t)j_omp * C);
             size_t n64 = C / 4;
-            uint16_t prev_sign = (j > 0) ? (A_u16[(size_t)j * C - 1] >> 15) : 0;
+            uint16_t prev_sign = (j_omp > 0) ? (A_u16[(size_t)j_omp * C - 1] >> 15) : 0;
             uint64_t h = 14695981039346656037ULL ^ prev_sign;
             for (size_t k = 0; k < n64; k++) { h ^= p64[k]; h *= 1099511628211ULL; }
-            hashes[j] = h;
+            hashes[j_omp] = h;
         }
 
         int U = 0;
@@ -1921,9 +1923,10 @@ XC_API xc_trunk_t *xc_trunk_create(const xc_plan_t *plan, const uint64_t *b, siz
     const size_t C = plan->C_SUB;
     const double invM = 1.0 / (double)plan->M;
     int nt = xc_wave_threads(plan->M);
+    int r;
 
     #pragma omp parallel for num_threads(nt) schedule(static)
-    for (int r = 0; r < 640; r++) {
+    for (r = 0; r < 640; r++) {
         double *rowB = T->Bz_trunk + (size_t)r * C * 2;
 #if XC_HAS_X86_SIMD
         if (plan->isa == XC_ISA_AVX512) sub_dif_avx512(rowB, C, plan->sub_re, plan->sub_im);
