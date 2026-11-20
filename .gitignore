@@ -1,0 +1,15 @@
+build/
+dist/
+*.egg-info/
+__pycache__/
+*.pyc
+*.o
+*.obj
+*.so
+*.dll
+*.dylib
+*.a
+*.lib
+*.exe
+test_xcruncher
+bench_xcruncher
