@@ -2187,6 +2187,8 @@ static int dispatch_pass1_auto_memo(const xc_plan_t *E, const uint64_t *A_words,
                     pass1_memo_avx512(E, A_words, n_words, DstZ, U, rep_j, slice_uid, n_nz);
                     return 1;
                 }
+#else
+                (void)slice_uid;
 #endif
             }
         }
@@ -3113,8 +3115,8 @@ static inline int xc_is_same_operand(const uint64_t *a, size_t na, const uint64_
     return memcmp(a, b, na * sizeof(uint64_t)) == 0;
 }
 
-static int should_use_ifma_ntt(size_t max_na, size_t max_nb, int *out_logN) {
 #if XC_HAS_X86_SIMD
+static int should_use_ifma_ntt(size_t max_na, size_t max_nb, int *out_logN) {
     if (!xc_has_ifma_ntt()) return 0;
     size_t la40 = (max_na * 8ULL + 4ULL) / 5ULL;
     size_t lb40 = (max_nb * 8ULL + 4ULL) / 5ULL;
@@ -3127,11 +3129,9 @@ static int should_use_ifma_ntt(size_t max_na, size_t max_nb, int *out_logN) {
         *out_logN = logN;
         return 1;
     }
-#else
-    (void)max_na; (void)max_nb; (void)out_logN;
-#endif
     return 0;
 }
+#endif
 
 /* =========================================================================================
  * PUBLIC PLAN, TRUNK, & MULTIPLICATION APIS
@@ -3441,8 +3441,7 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
     /* 6) Crandall-Fagin Adaptive B-Bit Vedic Vinculum Wave Engine */
     xc_plan_t plan;
     memset(&plan, 0, sizeof(plan));
-    int is_sq_wave = xc_is_same_operand(a, na, b, nb);
-    if (plan_init_internal(&plan, B, log_c, !is_sq_wave) != XC_OK) {
+    if (plan_init_internal(&plan, B, log_c, 1) != XC_OK) {
         plan_free_internal(&plan);
         return XC_ERR_NOMEM;
     }
