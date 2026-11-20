@@ -26,7 +26,7 @@ ifeq ($(OS),Windows_NT)
   SHARED_LIB := xcruncher.dll
 endif
 
-.PHONY: all test bench bench-100m clean
+.PHONY: all test bench bench-100m repro clean
 
 all: $(SHARED_LIB) test_xcruncher$(EXE) bench_xcruncher$(EXE)
 
@@ -39,6 +39,9 @@ test_xcruncher$(EXE): tests/test_xcruncher.c src/xcruncher.c include/xcruncher.h
 bench_xcruncher$(EXE): bench/bench_xcruncher.c src/xcruncher.c include/xcruncher.h
 	$(CC) $(CFLAGS) bench/bench_xcruncher.c src/xcruncher.c -o bench_xcruncher$(EXE) $(LDFLAGS) $(DL_LIBS)
 
+repro_raw_limbs$(EXE): bench/repro_raw_limbs.c src/xcruncher.c include/xcruncher.h
+	$(CC) $(CFLAGS) bench/repro_raw_limbs.c src/xcruncher.c -o repro_raw_limbs$(EXE) $(LDFLAGS) $(DL_LIBS)
+
 test: $(SHARED_LIB) test_xcruncher$(EXE)
 	./test_xcruncher$(EXE)
 	python3 tests/test_python.py || python tests/test_python.py
@@ -49,5 +52,8 @@ bench: bench_xcruncher$(EXE)
 bench-100m: bench_xcruncher$(EXE)
 	./bench_xcruncher$(EXE) --100m
 
+repro: repro_raw_limbs$(EXE)
+	./repro_raw_limbs$(EXE) --synthetic-100m --runs 7 --verify-gmp
+
 clean:
-	rm -f *.so *.dll *.dylib test_xcruncher test_xcruncher.exe bench_xcruncher bench_xcruncher.exe python/xcruncher/*.so python/xcruncher/*.dll python/xcruncher/*.dylib
+	rm -f *.so *.dll *.dylib test_xcruncher test_xcruncher.exe bench_xcruncher bench_xcruncher.exe repro_raw_limbs repro_raw_limbs.exe python/xcruncher/*.so python/xcruncher/*.dll python/xcruncher/*.dylib
