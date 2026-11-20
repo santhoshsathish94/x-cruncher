@@ -18,7 +18,7 @@ import subprocess
 from pathlib import Path
 from typing import Optional
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 _LIB: Optional[ctypes.CDLL] = None
 
@@ -128,6 +128,9 @@ def _bind_signatures(lib: ctypes.CDLL) -> ctypes.CDLL:
 
     lib.xc_mul_trunk.argtypes = [ctypes.c_void_p, u64_p, u64_p, ctypes.c_size_t, ctypes.c_void_p]
     lib.xc_mul_trunk.restype = ctypes.c_int
+
+    lib.xc_pi_hex_digits.argtypes = [ctypes.c_uint64, ctypes.c_char_p, ctypes.c_size_t]
+    lib.xc_pi_hex_digits.restype = ctypes.c_int
 
     return lib
 
@@ -244,4 +247,16 @@ class WaveTrunk:
         return -res if sign < 0 else res
 
 
-__all__ = ["__version__", "active_isa", "mul", "WavePlan", "WaveTrunk"]
+def pi_hex(hex_offset: int, digits: int = 16) -> str:
+    """Extract `digits` (1..20) exact hexadecimal digits of Pi after 16^(-hex_offset) with zero storage."""
+    if hex_offset < 0 or not (1 <= digits <= 20):
+        raise ValueError("hex_offset must be >= 0 and digits must be in 1..20")
+    lib = _find_or_build_lib()
+    buf = ctypes.create_string_buffer(digits + 1)
+    rc = lib.xc_pi_hex_digits(ctypes.c_uint64(hex_offset), buf, ctypes.c_size_t(digits))
+    if rc != 0:
+        raise RuntimeError(f"xc_pi_hex_digits failed with code {rc}")
+    return buf.value.decode("ascii")
+
+
+__all__ = ["__version__", "active_isa", "mul", "pi_hex", "WavePlan", "WaveTrunk"]

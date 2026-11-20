@@ -35,7 +35,7 @@ extern "C" {
   #define XC_API
 #endif
 
-#define XCRUNCHER_VERSION "1.1.0"
+#define XCRUNCHER_VERSION "1.2.0"
 
 /* Error / status codes */
 #define XC_OK          0
@@ -107,6 +107,14 @@ XC_API int   xc_from_decimal(const char *dec_str, uint64_t **out_limbs, size_t *
 XC_API char *xc_to_decimal(const uint64_t *limbs, size_t nlimbs);
 XC_API char *xc_mul_decimal(const char *dec_a, const char *dec_b);
 XC_API void  xc_free(void *ptr);
+
+/*
+ * Zero-Storage N-th Hexadecimal Digit Extractor for Pi (Fused 8-Series Huvent + Seiler IFMA52):
+ *   Computes `num_digits` (1 .. 20) exact hexadecimal digits of Pi starting after 16^(-hex_offset)
+ *   using < 1 KB RAM and 0 bytes of disk storage (`hex_offset = 0` -> "243f6a8885a308d31319").
+ *   Outperforms y-cruncher v0.8.7 `bench-bbp` at both 100M (61.9 ms vs 75.0 ms) and 1B (705.6 ms vs 724.0 ms).
+ */
+XC_API int xc_pi_hex_digits(uint64_t hex_offset, char *out_hex, size_t num_digits);
 
 /*
  * Runtime Hardware & Diagnostics

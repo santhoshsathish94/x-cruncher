@@ -152,6 +152,35 @@ static void bench_scale(size_t digits, int reps) {
     free(a_sp); free(b_sp); free(a_rnd); free(b_rnd); free(c_out); free(c_gmp);
 }
 
+static void bench_pi_hex(int include_1b) {
+    static const struct { uint64_t off; const char *ref; int reps; } cases[] = {
+        {    1000000ULL, "6c65e52cb459350050e4", 3 },
+        {   10000000ULL, "7af5863efed8de97033c", 3 },
+        {  100000000ULL, "cb840e21926ec5ae0d2f", 2 },
+        { 1000000000ULL, "5895585a0428b564084e", 1 }
+    };
+    printf("========================================================================================================\n");
+    printf(" Zero-Storage N-th Hexadecimal Pi Digit Extraction (20 Hex Digits = 80 Bits, < 1 KB RAM, 0 Disk)\n");
+    printf("========================================================================================================\n");
+    int count = include_1b ? 4 : 3;
+    char warm[24];
+    xc_pi_hex_digits(10000ULL, warm, 20);
+    for (int i = 0; i < count; i++) {
+        char got[24] = {0};
+        double best = 1e9;
+        for (int r = 0; r < cases[i].reps; r++) {
+            double t0 = now_ms();
+            xc_pi_hex_digits(cases[i].off, got, 20);
+            double dt = now_ms() - t0;
+            if (dt < best) best = dt;
+        }
+        printf("  Offset 16^-%-11llu : %s | %8.2f ms %s\n",
+               (unsigned long long)(cases[i].off + 1ULL), got, best,
+               strcmp(got, cases[i].ref) == 0 ? "[20/20 EXACT vs y-cruncher]" : "[MISMATCH!]");
+    }
+    printf("\n");
+}
+
 int main(int argc, char **argv) {
     int run_100m = 0;
     for (int i = 1; i < argc; i++) {
@@ -170,7 +199,8 @@ int main(int argc, char **argv) {
     if (run_100m) {
         bench_scale(100000000ULL, 3);
     } else {
-        printf("Tip: Pass `--100m` to run the 100,000,000 x 100,000,000 digit (200M output digit) benchmark.\n");
+        printf("Tip: Pass `--100m` to also run 100M-digit multiplication & 1B-offset Pi hex extraction.\n\n");
     }
+    bench_pi_hex(run_100m);
     return 0;
 }

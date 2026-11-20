@@ -198,6 +198,16 @@ int main(void) {
         xc_free(p);
     }
 
+    /* 8. Zero-Storage N-th Hexadecimal Digit Extractor for Pi (verified vs y-cruncher v0.8.7) */
+    {
+        char h0[24] = {0}, h1m[24] = {0};
+        int r0 = xc_pi_hex_digits(0ULL,       h0,  20);
+        int r1 = xc_pi_hex_digits(1000000ULL, h1m, 20);
+        CHECK(r0 == XC_OK && strcmp(h0,  "243f6a8885a308d31319") == 0 &&
+              r1 == XC_OK && strcmp(h1m, "6c65e52cb459350050e4") == 0,
+              "Zero-storage Pi hex digit extraction (20/20 hex digits at offset 0 & 1,000,000) exact");
+    }
+
     printf("========================================================================\n");
     printf(" RESULT: %d passed, %d failed\n", g_pass, g_fail);
     printf("========================================================================\n");

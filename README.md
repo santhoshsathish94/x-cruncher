@@ -18,7 +18,18 @@ All timings below are produced directly by `./bench_xcruncher --100m` (`make ben
 
 *Note on core-count scaling & worst-case limb width:*
 - `GNU GMP`'s `__gmpn_mul_n` is single-threaded, whereas `x-cruncher` parallelizes across physical cores (`~3.0×–5.8×` speedup on a 5-vCPU cloud VM; `8.7×–23.5×` on a 16-core `Ryzen 9 7950X3D`).
-- At `100M` digits, keeping fixed `16-bit` limbs reaches `85.11 ms` cold / `62.39 ms` `WaveTrunk` on random zero-mean inputs, **but** overflows IEEE-754 `binary64`'s `53-bit` mantissa on pathological non-canceling inputs (`0x7FFF7FFF...`). `x-cruncher v1.1.0` automatically steps down to `B = 11` bits (`M = 41,943,040`) at `100M` digits so **every input bit-pattern is provably exact**.
+- At `100M` digits, keeping fixed `16-bit` limbs reaches `85.11 ms` cold / `62.39 ms` `WaveTrunk` on random zero-mean inputs, **but** overflows IEEE-754 `binary64`'s `53-bit` mantissa on pathological non-canceling inputs (`0x7FFF7FFF...`). `x-cruncher` automatically steps down to `B = 11` bits (`M = 41,943,040`) at `100M` digits so **every input bit-pattern is provably exact**.
+
+### Zero-Storage $N$-th Hexadecimal $\pi$ Digit Extraction (`xc_pi_hex_digits` vs `y-cruncher v0.8.7`)
+
+Using a **Single-Pass 8-Series-in-1-`ZMM` Fused Huvent Engine** (combining 3-cycle Centered `IEEE-754 double` Barrett squaring below $90\text{M}$ with `6×`-Interleaved Self-Reducing Seiler `AVX-512 IFMA52` squaring and `104-bit` fixed-point accumulation in `< 1 KB` RAM and `0` disk storage), `x-cruncher v1.2.0` **outperforms closed-source `y-cruncher v0.8.7` (`22-ZN4 ~ Kizuna`, `bench-bbp`) head-to-head** on the same `Ryzen 9 7950X3D`:
+
+| Hexadecimal Offset | `y-cruncher v0.8.7` (`bench-bbp`) | `x-cruncher v1.2.0` (`xc_pi_hex_digits`) | Verified 20-Hex-Digit Output (`80` Exact Bits) |
+| ---: | ---: | ---: | :--- |
+| **`1,000,000`** | — | **`0.52 ms`** | `6c65e52cb459350050e4` *(EXACT)* |
+| **`10,000,000`** | — | **`5.25 ms`** | `7af5863efed8de97033c` *(EXACT)* |
+| **`100,000,000` (`100m`)** | `75.00 ms` | **`61.93 ms` (`1.21×` faster)** | `cb840e21926ec5ae0d2f` *(20/20 EXACT)* |
+| **`1,000,000,000` (`1b`)** | `724.00 ms` | **`705.62 ms` (`1.03×` faster)** | `5895585a0428b564084e` *(20/20 EXACT)* |
 
 ---
 

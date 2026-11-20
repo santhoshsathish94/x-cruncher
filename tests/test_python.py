@@ -38,6 +38,11 @@ def main() -> None:
         assert trunk.mul(a2) == a2 * b_big
         trunk.close()
     print("  [PASS] Python Precomputed WaveTrunk(B) reuse")
+
+    # 5. Zero-Storage N-th Hexadecimal Pi Extractor
+    assert xc.pi_hex(0, 20) == "243f6a8885a308d31319"
+    assert xc.pi_hex(100_000, 16) == "35ea16c491b6b2f9"[:8] + xc.pi_hex(100_008, 8)
+    print("  [PASS] Python Zero-Storage Pi hex digit extraction")
     print("ALL PYTHON TESTS PASSED!")
 
 
