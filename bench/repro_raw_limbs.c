@@ -14,8 +14,11 @@
 #if defined(_WIN32) && !defined(_CRT_SECURE_NO_WARNINGS)
   #define _CRT_SECURE_NO_WARNINGS
 #endif
-#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
-  #define _POSIX_C_SOURCE 200809L
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+  #define _GNU_SOURCE
+#endif
+#if defined(__APPLE__) && !defined(_DARWIN_C_SOURCE)
+  #define _DARWIN_C_SOURCE
 #endif
 
 #include "xcruncher.h"
@@ -30,7 +33,6 @@
 
 #if defined(_WIN32)
   #include <windows.h>
-  #include <malloc.h>
   static double now_ms(void) {
       LARGE_INTEGER f, c;
       QueryPerformanceFrequency(&f);
@@ -40,6 +42,7 @@
 #else
   #include <time.h>
   #include <dlfcn.h>
+  #include <sys/time.h>
   #include <sys/resource.h>
   static double now_ms(void) {
       struct timespec ts;
@@ -90,21 +93,11 @@ static gmp_mul_fn load_gmp_mul(void) {
 }
 
 static uint64_t *alloc_u64(size_t n) {
-#if defined(_WIN32)
-    return (uint64_t *)_aligned_malloc(n * sizeof(uint64_t), 64);
-#else
-    void *p = NULL;
-    if (posix_memalign(&p, 64, n * sizeof(uint64_t)) != 0) return NULL;
-    return (uint64_t *)p;
-#endif
+    return (uint64_t *)malloc(n * sizeof(uint64_t));
 }
 
 static void free_u64(uint64_t *p) {
-#if defined(_WIN32)
-    _aligned_free(p);
-#else
     free(p);
-#endif
 }
 
 static uint64_t *read_limb_file(const char *path, size_t *out_n) {
