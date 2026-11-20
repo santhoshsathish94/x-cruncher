@@ -37,7 +37,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Run AddressSanitizer + UndefinedBehaviorSanitizer (AVX-512 / AVX2 / Scalar)
+      - name: Install GCC 14 and Clang OpenMP
         run: |
-          gcc -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san
-          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san
+          sudo apt-get update
+          sudo apt-get install -y gcc-14 clang libomp-dev
+
+      - name: Run AddressSanitizer + UBSan on GCC 13, GCC 14, and Clang (AVX-512 / AVX2 / Scalar)
+        run: |
+          gcc -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc13
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_gcc13
+          gcc-14 -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_gcc14
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_gcc14
+          clang -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san_clang
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san_clang

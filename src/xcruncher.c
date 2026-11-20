@@ -1472,10 +1472,37 @@ XC_TARGET_AVX512 static void dft640_inv_8x(const __m512d *in_re, const __m512d *
 
 #if defined(__SANITIZE_ADDRESS__)
   #define XC_STREAM512_PD(ptr, val) _mm512_storeu_pd((ptr), (val))
+#elif defined(__has_feature)
+  #if __has_feature(address_sanitizer)
+    #define XC_STREAM512_PD(ptr, val) _mm512_storeu_pd((ptr), (val))
+  #else
+    #define XC_STREAM512_PD(ptr, val) \
+        ((((uintptr_t)(ptr) & 63U) == 0U) ? _mm512_stream_pd((ptr), (val)) : _mm512_storeu_pd((ptr), (val)))
+  #endif
 #else
   #define XC_STREAM512_PD(ptr, val) \
       ((((uintptr_t)(ptr) & 63U) == 0U) ? _mm512_stream_pd((ptr), (val)) : _mm512_storeu_pd((ptr), (val)))
 #endif
+
+XC_TARGET_AVX512 static inline int32_t vedic_limb_one_512(const uint64_t *A_words, size_t n_words,
+                                                          size_t bit_m, int B, uint32_t mask1) {
+    uint32_t raw1;
+    if (__builtin_expect(bit_m > 0, 1)) {
+        size_t bp = bit_m - 1;
+        size_t w  = bp >> 6;
+        unsigned sh = (unsigned)(bp & 63U);
+        uint64_t lo = (w < n_words) ? A_words[w] : 0ULL;
+        uint64_t hi = (w + 1 < n_words) ? A_words[w + 1] : 0ULL;
+        uint64_t comb = (sh == 0U) ? lo : ((lo >> sh) | (hi << (64U - sh)));
+        raw1 = (uint32_t)comb & mask1;
+    } else {
+        raw1 = (uint32_t)((n_words > 0 ? A_words[0] : 0ULL) << 1) & mask1;
+    }
+    int32_t sp = (int32_t)(raw1 & 1U);
+    int32_t u  = (int32_t)(raw1 >> 1);
+    int32_t s  = (int32_t)(raw1 >> B);
+    return u - (s << B) + sp;
+}
 
 XC_TARGET_AVX512 static inline __m512d load_vedic8_real_512(const uint64_t *A_words, size_t n_words, size_t limb_idx, int B) {
     if (B == 16) {
@@ -1492,45 +1519,41 @@ XC_TARGET_AVX512 static inline __m512d load_vedic8_real_512(const uint64_t *A_wo
         }
     }
     const uint32_t mask1 = (1U << (B + 1)) - 1U;
-    int32_t d_arr[8];
-    for (int m = 0; m < 8; m++) {
-        size_t bit_m = (limb_idx + (size_t)m) * (size_t)B;
-        uint32_t raw1;
-        if (__builtin_expect(bit_m > 0, 1)) {
-            size_t bp = bit_m - 1;
-            size_t w  = bp >> 6;
-            unsigned sh = (unsigned)(bp & 63U);
-            uint64_t lo = (w < n_words) ? A_words[w] : 0ULL;
-            uint64_t hi = (w + 1 < n_words) ? A_words[w + 1] : 0ULL;
-            uint64_t comb = (sh == 0U) ? lo : ((lo >> sh) | (hi << (64U - sh)));
-            raw1 = (uint32_t)comb & mask1;
-        } else {
-            raw1 = (uint32_t)((n_words > 0 ? A_words[0] : 0ULL) << 1) & mask1;
-        }
-        int32_t sp = (int32_t)(raw1 & 1U);
-        int32_t u  = (int32_t)(raw1 >> 1);
-        int32_t s  = (int32_t)(raw1 >> B);
-        d_arr[m] = u - (s << B) + sp;
-    }
-    return _mm512_cvtepi32_pd(_mm256_loadu_si256((const __m256i *)d_arr));
+    const size_t base_bit = limb_idx * (size_t)B;
+    const size_t sb = (size_t)B;
+    __m256i d32 = _mm256_setr_epi32(
+        vedic_limb_one_512(A_words, n_words, base_bit + 0 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 1 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 2 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 3 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 4 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 5 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 6 * sb, B, mask1),
+        vedic_limb_one_512(A_words, n_words, base_bit + 7 * sb, B, mask1));
+    return _mm512_cvtepi32_pd(d32);
 }
 
 XC_TARGET_AVX512 static inline void lut_fourstep_8x_512(const xc_plan_t *E, size_t b0, int r, __m512d *tr_out, __m512d *ti_out) {
     const size_t fourM = 4 * E->M;
     const size_t stride = (size_t)(4 * r + 1);
-    size_t idx = (b0 * stride) % fourM;
-    double tr[8], ti[8];
-    for (int m = 0; m < 8; m++) {
-        size_t f = idx & 4095ULL, c = idx >> 12;
-        double cr = E->coarse_re[c], ci = E->coarse_im[c];
-        double fr = E->fine_re[f],   fi = E->fine_im[f];
-        tr[m] = cr * fr - ci * fi;
-        ti[m] = cr * fi + ci * fr;
-        idx += stride;
-        if (idx >= fourM) idx -= fourM;
-    }
-    *tr_out = _mm512_loadu_pd(tr);
-    *ti_out = _mm512_loadu_pd(ti);
+    size_t i0 = (b0 * stride) % fourM;
+    size_t i1 = i0 + stride; if (i1 >= fourM) i1 -= fourM;
+    size_t i2 = i1 + stride; if (i2 >= fourM) i2 -= fourM;
+    size_t i3 = i2 + stride; if (i3 >= fourM) i3 -= fourM;
+    size_t i4 = i3 + stride; if (i4 >= fourM) i4 -= fourM;
+    size_t i5 = i4 + stride; if (i5 >= fourM) i5 -= fourM;
+    size_t i6 = i5 + stride; if (i6 >= fourM) i6 -= fourM;
+    size_t i7 = i6 + stride; if (i7 >= fourM) i7 -= fourM;
+
+    __m512d cr = _mm512_setr_pd(E->coarse_re[i0 >> 12], E->coarse_re[i1 >> 12], E->coarse_re[i2 >> 12], E->coarse_re[i3 >> 12],
+                                E->coarse_re[i4 >> 12], E->coarse_re[i5 >> 12], E->coarse_re[i6 >> 12], E->coarse_re[i7 >> 12]);
+    __m512d ci = _mm512_setr_pd(E->coarse_im[i0 >> 12], E->coarse_im[i1 >> 12], E->coarse_im[i2 >> 12], E->coarse_im[i3 >> 12],
+                                E->coarse_im[i4 >> 12], E->coarse_im[i5 >> 12], E->coarse_im[i6 >> 12], E->coarse_im[i7 >> 12]);
+    __m512d fr = _mm512_setr_pd(E->fine_re[i0 & 4095U], E->fine_re[i1 & 4095U], E->fine_re[i2 & 4095U], E->fine_re[i3 & 4095U],
+                                E->fine_re[i4 & 4095U], E->fine_re[i5 & 4095U], E->fine_re[i6 & 4095U], E->fine_re[i7 & 4095U]);
+    __m512d fi = _mm512_setr_pd(E->fine_im[i0 & 4095U], E->fine_im[i1 & 4095U], E->fine_im[i2 & 4095U], E->fine_im[i3 & 4095U],
+                                E->fine_im[i4 & 4095U], E->fine_im[i5 & 4095U], E->fine_im[i6 & 4095U], E->fine_im[i7 & 4095U]);
+    CMUL512(cr, ci, fr, fi, *tr_out, *ti_out);
 }
 
 XC_TARGET_AVX512 static void pass1_single_avx512_worker(const xc_plan_t *E, const uint64_t *A_words, size_t n_words,
@@ -1631,10 +1654,14 @@ XC_TARGET_AVX512 static void sub_dif_avx512(double *row, size_t C, const double 
                 _mm512_storeu_pd(p0, _mm512_add_pd(u_r, v_r));
                 _mm512_storeu_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
 
-                double wr_arr[8], wi_arr[8];
-                for (int m = 0; m < 8; m++) { size_t tk = (j + (size_t)m) * step; wr_arr[m] = sub_re[tk]; wi_arr[m] = sub_im[tk]; }
+                __m512d w_r = _mm512_setr_pd(
+                    sub_re[(j + 0) * step], sub_re[(j + 1) * step], sub_re[(j + 2) * step], sub_re[(j + 3) * step],
+                    sub_re[(j + 4) * step], sub_re[(j + 5) * step], sub_re[(j + 6) * step], sub_re[(j + 7) * step]);
+                __m512d w_i = _mm512_setr_pd(
+                    sub_im[(j + 0) * step], sub_im[(j + 1) * step], sub_im[(j + 2) * step], sub_im[(j + 3) * step],
+                    sub_im[(j + 4) * step], sub_im[(j + 5) * step], sub_im[(j + 6) * step], sub_im[(j + 7) * step]);
                 __m512d o_r, o_i;
-                CMUL512(d_r, d_i, _mm512_loadu_pd(wr_arr), _mm512_loadu_pd(wi_arr), o_r, o_i);
+                CMUL512(d_r, d_i, w_r, w_i, o_r, o_i);
                 _mm512_storeu_pd(p1, o_r); _mm512_storeu_pd(p1 + 8, o_i);
             }
         }
@@ -1716,9 +1743,13 @@ XC_TARGET_AVX512 static void sub_idit_avx512(double *row, size_t C, const double
                 double *p0 = row + (base + j) * 2, *p1 = row + (base + j + half) * 2;
                 __m512d u_r = _mm512_loadu_pd(p0), u_i = _mm512_loadu_pd(p0 + 8);
                 __m512d v_r = _mm512_loadu_pd(p1), v_i = _mm512_loadu_pd(p1 + 8);
-                double wr_arr[8], wi_arr[8];
-                for (int m = 0; m < 8; m++) { size_t tk = (j + (size_t)m) * step; wr_arr[m] = sub_re[tk]; wi_arr[m] = sub_im[tk]; }
-                CMUL512_CONJ(v_r, v_i, _mm512_loadu_pd(wr_arr), _mm512_loadu_pd(wi_arr), v_r, v_i);
+                __m512d w_r = _mm512_setr_pd(
+                    sub_re[(j + 0) * step], sub_re[(j + 1) * step], sub_re[(j + 2) * step], sub_re[(j + 3) * step],
+                    sub_re[(j + 4) * step], sub_re[(j + 5) * step], sub_re[(j + 6) * step], sub_re[(j + 7) * step]);
+                __m512d w_i = _mm512_setr_pd(
+                    sub_im[(j + 0) * step], sub_im[(j + 1) * step], sub_im[(j + 2) * step], sub_im[(j + 3) * step],
+                    sub_im[(j + 4) * step], sub_im[(j + 5) * step], sub_im[(j + 6) * step], sub_im[(j + 7) * step]);
+                CMUL512_CONJ(v_r, v_i, w_r, w_i, v_r, v_i);
                 _mm512_storeu_pd(p0, _mm512_add_pd(u_r, v_r)); _mm512_storeu_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
                 _mm512_storeu_pd(p1, _mm512_sub_pd(u_r, v_r)); _mm512_storeu_pd(p1 + 8, _mm512_sub_pd(u_i, v_i));
             }
