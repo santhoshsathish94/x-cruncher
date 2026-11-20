@@ -31,11 +31,20 @@
   }
 #endif
 
-typedef void (*gmp_mul_n_fn)(uint64_t *, const uint64_t *, const uint64_t *, long);
+typedef void (*gmp_mul_n_fn)(uint64_t *, const uint64_t *, const uint64_t *, intptr_t);
 static gmp_mul_n_fn g_gmp_mul_n = NULL;
 
 static void try_load_gmp(void) {
-#if !defined(_WIN32)
+#if defined(_WIN32)
+    const char *libs[] = {"libgmp-10.dll", "gmp.dll", "C:\\msys64\\ucrt64\\bin\\libgmp-10.dll", "C:\\msys64\\mingw64\\bin\\libgmp-10.dll", NULL};
+    for (int i = 0; libs[i]; i++) {
+        HMODULE h = LoadLibraryA(libs[i]);
+        if (h) {
+            FARPROC p = GetProcAddress(h, "__gmpn_mul_n");
+            if (p) { memcpy(&g_gmp_mul_n, &p, sizeof(p)); break; }
+        }
+    }
+#else
     const char *libs[] = {"libgmp.so.10", "libgmp.so", "libgmp.dylib", NULL};
     for (int i = 0; libs[i]; i++) {
         void *h = dlopen(libs[i], RTLD_NOW);
@@ -73,7 +82,7 @@ static void bench_scale(size_t digits, int reps) {
     double ms_gmp = -1.0;
     if (g_gmp_mul_n) {
         double t0 = now_ms();
-        g_gmp_mul_n(c_gmp, a_rnd, b_rnd, (long)n_limbs);
+        g_gmp_mul_n(c_gmp, a_rnd, b_rnd, (intptr_t)n_limbs);
         ms_gmp = now_ms() - t0;
     }
 
@@ -123,7 +132,7 @@ static void bench_scale(size_t digits, int reps) {
 
     /* One-shot Squaring `xc_mul_u64(c_out, a_rnd, n, a_rnd, n)` (like Pi * Pi) */
     uint64_t *c_gmp_sq = g_gmp_mul_n ? (uint64_t *)malloc(2 * n_limbs * 8) : NULL;
-    if (g_gmp_mul_n) g_gmp_mul_n(c_gmp_sq, a_rnd, a_rnd, (long)n_limbs);
+    if (g_gmp_mul_n) g_gmp_mul_n(c_gmp_sq, a_rnd, a_rnd, (intptr_t)n_limbs);
     double best_sq = 1e9;
     for (int r = 0; r < reps; r++) {
         double t0 = now_ms();
