@@ -121,6 +121,19 @@ static void bench_scale(size_t digits, int reps) {
     }
     int ok_trunk = c_gmp ? (memcmp(c_out, c_gmp, 2 * n_limbs * 8) == 0) : 1;
 
+    /* One-shot Squaring `xc_mul_u64(c_out, a_rnd, n, a_rnd, n)` (like Pi * Pi) */
+    uint64_t *c_gmp_sq = g_gmp_mul_n ? (uint64_t *)malloc(2 * n_limbs * 8) : NULL;
+    if (g_gmp_mul_n) g_gmp_mul_n(c_gmp_sq, a_rnd, a_rnd, (long)n_limbs);
+    double best_sq = 1e9;
+    for (int r = 0; r < reps; r++) {
+        double t0 = now_ms();
+        xc_mul_u64(c_out, a_rnd, n_limbs, a_rnd, n_limbs);
+        double dt = now_ms() - t0;
+        if (dt < best_sq) best_sq = dt;
+    }
+    int ok_sq = c_gmp_sq ? (memcmp(c_out, c_gmp_sq, 2 * n_limbs * 8) == 0) : 1;
+    free(c_gmp_sq);
+
     /* Near-2^k Sparse Vedic Polynomial at the EXACT SAME bit-length! */
     uint64_t *a_sp = (uint64_t *)malloc(n_limbs * 8);
     uint64_t *b_sp = (uint64_t *)malloc(n_limbs * 8);
@@ -137,12 +150,15 @@ static void bench_scale(size_t digits, int reps) {
     if (ms_gmp > 0.0) {
         printf("  x-cruncher Cold Random A * B     : %8.2f ms (%5.1fx faster than GMP) %s\n",
                best_cold, ms_gmp / best_cold, ok_cold ? "[EXACT]" : "[MISMATCH!]");
+        printf("  x-cruncher One-Shot Square A * A : %8.2f ms (%5.1fx faster than GMP) %s\n",
+               best_sq, ms_gmp / best_sq, ok_sq ? "[EXACT]" : "[MISMATCH!]");
         printf("  x-cruncher WaveTrunk(B) * A      : %8.2f ms (%5.1fx faster than GMP) %s\n",
                best_trunk, ms_gmp / best_trunk, ok_trunk ? "[EXACT]" : "[MISMATCH!]");
         printf("  x-cruncher Vedic Near-2^k Sparse : %8.2f ms (%5.1fx faster than GMP) [NAF Fast-Path]\n\n",
                best_sp, ms_gmp / (best_sp > 1e-4 ? best_sp : 1e-4));
     } else {
         printf("  x-cruncher Cold Random A * B     : %8.2f ms\n", best_cold);
+        printf("  x-cruncher One-Shot Square A * A : %8.2f ms\n", best_sq);
         printf("  x-cruncher WaveTrunk(B) * A      : %8.2f ms\n", best_trunk);
         printf("  x-cruncher Vedic Near-2^k Sparse : %8.2f ms [NAF Fast-Path]\n\n", best_sp);
     }

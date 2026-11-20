@@ -15,9 +15,16 @@
 #include <string.h>
 
 #if defined(_WIN32)
+  #ifndef WIN32_LEAN_AND_MEAN
+    #define WIN32_LEAN_AND_MEAN
+  #endif
+  #include <windows.h>
   #include <malloc.h>
 #else
   #include <sys/mman.h>
+  #if defined(__linux__)
+    #include <sched.h>
+  #endif
 #endif
 
 #ifdef _OPENMP
@@ -78,25 +85,188 @@ static void xc_aligned_free_buf(void *p) {
 #endif
 }
 
+#if defined(__linux__) && defined(_OPENMP)
+static int xc_read_int_file(const char *path, long long *out_val) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[64] = {0};
+    int ok = 0;
+    if (fgets(buf, sizeof(buf), f)) {
+        char *endp = NULL;
+        long long v = strtoll(buf, &endp, 10);
+        if (endp != buf) { *out_val = v; ok = 1; }
+    }
+    fclose(f);
+    return ok;
+}
+
+static int xc_parse_cpu_max_file(const char *path) {
+    FILE *f = fopen(path, "r");
+    if (!f) return 0;
+    char buf[128] = {0};
+    int quota_cpus = 0;
+    if (fgets(buf, sizeof(buf), f)) {
+        if (strncmp(buf, "max", 3) != 0) {
+            long long q = 0, p = 100000;
+            if (sscanf(buf, "%lld %lld", &q, &p) >= 1 && q > 0 && p > 0) {
+                quota_cpus = (int)((q + p - 1) / p);
+                if (quota_cpus < 1) quota_cpus = 1;
+            }
+        }
+    }
+    fclose(f);
+    return quota_cpus;
+}
+
+static int xc_linux_cgroup_quota_cpus(void) {
+    int best = 0;
+    /* 1) Check process-specific cgroup v2 path from /proc/self/cgroup (`0::/subpath`) */
+    FILE *cg = fopen("/proc/self/cgroup", "r");
+    if (cg) {
+        char line[256];
+        while (fgets(line, sizeof(line), cg)) {
+            if (strncmp(line, "0::", 3) == 0) {
+                char *sub = line + 3;
+                size_t len = strlen(sub);
+                while (len > 0 && (sub[len - 1] == '\n' || sub[len - 1] == '\r')) sub[--len] = '\0';
+                if (len > 0) {
+                    char path[384];
+                    snprintf(path, sizeof(path), "/sys/fs/cgroup%s/cpu.max", sub);
+                    int q = xc_parse_cpu_max_file(path);
+                    if (q > 0 && (best == 0 || q < best)) best = q;
+                }
+            }
+        }
+        fclose(cg);
+    }
+    /* 2) Root cgroup v2 `/sys/fs/cgroup/cpu.max` */
+    {
+        int q = xc_parse_cpu_max_file("/sys/fs/cgroup/cpu.max");
+        if (q > 0 && (best == 0 || q < best)) best = q;
+    }
+    /* 3) Cgroup v1 `/sys/fs/cgroup/cpu/cpu.cfs_quota_us` & `cpu.cfs_period_us` */
+    {
+        long long q = -1, p = 100000;
+        if (xc_read_int_file("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", &q) && q > 0) {
+            (void)xc_read_int_file("/sys/fs/cgroup/cpu/cpu.cfs_period_us", &p);
+            if (p <= 0) p = 100000;
+            int c = (int)((q + p - 1) / p);
+            if (c < 1) c = 1;
+            if (best == 0 || c < best) best = c;
+        }
+    }
+    return best;
+}
+
+static void xc_linux_detect_topology(int max_t, int *out_logical, int *out_phys) {
+    int logical = max_t, phys = max_t;
+    cpu_set_t mask;
+    CPU_ZERO(&mask);
+    if (sched_getaffinity(0, sizeof(mask), &mask) == 0) {
+        int cnt = CPU_COUNT(&mask);
+        if (cnt > 0) logical = cnt;
+        /* Count distinct (package_id, core_id) pairs strictly within the allowed affinity mask */
+        int seen_pkg[512], seen_core[512], n_seen = 0, any_topo = 0;
+        for (int cpu = 0; cpu < CPU_SETSIZE && n_seen < 512; cpu++) {
+            if (!CPU_ISSET(cpu, &mask)) continue;
+            char p_core[128], p_pkg[128];
+            long long cid = -1, pid = 0;
+            snprintf(p_core, sizeof(p_core), "/sys/devices/system/cpu/cpu%d/topology/core_id", cpu);
+            if (!xc_read_int_file(p_core, &cid)) continue;
+            any_topo = 1;
+            snprintf(p_pkg, sizeof(p_pkg), "/sys/devices/system/cpu/cpu%d/topology/physical_package_id", cpu);
+            (void)xc_read_int_file(p_pkg, &pid);
+            int dup = 0;
+            for (int k = 0; k < n_seen; k++) {
+                if (seen_pkg[k] == (int)pid && seen_core[k] == (int)cid) { dup = 1; break; }
+            }
+            if (!dup) {
+                seen_pkg[n_seen] = (int)pid;
+                seen_core[n_seen] = (int)cid;
+                n_seen++;
+            }
+        }
+        if (any_topo && n_seen > 0) phys = n_seen;
+        else phys = logical;
+    }
+    int quota = xc_linux_cgroup_quota_cpus();
+    if (quota > 0 && quota < logical) logical = quota;
+    if (logical > max_t) logical = max_t;
+    if (phys > logical) phys = logical;
+    *out_logical = (logical > 0) ? logical : 1;
+    *out_phys    = (phys > 0) ? phys : 1;
+}
+#endif /* __linux__ && _OPENMP */
+
+/* Optimal thread count for pure compute-bound kernels (e.g., zero-storage Pi BBP):
+   uses all allowed logical/SMT threads up to any active container cgroup CPU quota. */
+static int xc_compute_threads(void) {
+#ifdef _OPENMP
+    int max_t = omp_get_max_threads();
+    if (max_t <= 1) return 1;
+    const char *env_omp = getenv("OMP_NUM_THREADS");
+    if (env_omp && env_omp[0] != '\0') return max_t;
+    static int cached_ct = 0;
+    if (cached_ct == 0) {
+  #if defined(__linux__)
+        int logical = max_t, phys = max_t;
+        xc_linux_detect_topology(max_t, &logical, &phys);
+        (void)phys;
+        cached_ct = logical;
+  #else
+        cached_ct = max_t;
+  #endif
+    }
+    return cached_ct;
+#else
+    return 1;
+#endif
+}
+
+/* Optimal thread count for memory+compute wave/NTT engines:
+   - Respects explicit OMP_NUM_THREADS if set by caller.
+   - On large bare-metal SMT machines (>= 16 logical & >= 8 physical cores with 2x SMT),
+     targets physical cores so dual-channel DDR5 is not oversubscribed.
+   - On VMs, containers (4..12 vCPU quotas), Apple Silicon (no SMT), and taskset slices,
+     uses ALL available/quota-allowed vCPUs instead of halving them! */
 static int xc_wave_threads(size_t M) {
 #ifdef _OPENMP
     if (M < 16384) return 1;
+    const char *env_omp = getenv("OMP_NUM_THREADS");
+    if (env_omp && env_omp[0] != '\0') {
+        int mt = omp_get_max_threads();
+        return (mt > 0) ? mt : 1;
+    }
     static int best_nt = 0;
     if (best_nt == 0) {
         int max_t = omp_get_max_threads();
   #if defined(__linux__)
-        int phys = max_t;
-        FILE *f = fopen("/sys/devices/system/cpu/cpu0/topology/thread_siblings_list", "r");
-        if (f) {
-            char buf[64] = {0};
-            if (fgets(buf, sizeof(buf), f) && (strchr(buf, ',') || strchr(buf, '-'))) {
-                phys = (max_t >= 4) ? (max_t / 2) : max_t;
+        int logical = max_t, phys = max_t;
+        xc_linux_detect_topology(max_t, &logical, &phys);
+        if (logical >= 16 && phys >= 8 && logical >= 2 * phys) best_nt = phys;
+        else best_nt = logical;
+  #elif defined(__APPLE__)
+        best_nt = (max_t > 0) ? max_t : 1; /* Apple Silicon has no SMT */
+  #elif defined(_WIN32)
+        int phys = 0;
+        DWORD len = 0;
+        GetLogicalProcessorInformation(NULL, &len);
+        if (len > 0) {
+            SYSTEM_LOGICAL_PROCESSOR_INFORMATION * slpi = (SYSTEM_LOGICAL_PROCESSOR_INFORMATION *)malloc(len);
+            if (slpi) {
+                if (GetLogicalProcessorInformation(slpi, &len)) {
+                    DWORD n = len / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION);
+                    for (DWORD i = 0; i < n; i++) {
+                        if (slpi[i].Relationship == RelationProcessorCore) phys++;
+                    }
+                }
+                free(slpi);
             }
-            fclose(f);
         }
-        best_nt = (phys > 0) ? phys : 1;
+        if (max_t >= 16 && phys >= 8 && max_t >= 2 * phys) best_nt = phys;
+        else best_nt = (max_t > 0) ? max_t : 1;
   #else
-        best_nt = (max_t > 16) ? (max_t / 2) : (max_t > 0 ? max_t : 1);
+        best_nt = (max_t >= 24) ? (max_t / 2) : (max_t > 0 ? max_t : 1);
   #endif
     }
     return best_nt;
@@ -1010,8 +1180,9 @@ static void pass2_convolve_scalar(const xc_plan_t *E, const double *Bz_src, int 
     for (r = 0; r < 640; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
+        int is_sq = (Bz_src == E->Az);
         sc_sub_dif(rowA, C, E->sub_re, E->sub_im);
-        if (!b_is_trunk) sc_sub_dif(rowB, C, E->sub_re, E->sub_im);
+        if (!b_is_trunk && !is_sq) sc_sub_dif(rowB, C, E->sub_re, E->sub_im);
         for (size_t j = 0; j < C; j += 8) {
             double *pa = rowA + 2 * j;
             const double *pb = Bz_src + ((size_t)r * C + j) * 2;
@@ -1288,8 +1459,9 @@ XC_TARGET_AVX2 static void pass2_convolve_avx2_row(const xc_plan_t *E, const dou
     for (int r = r_beg; r < r_end; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
+        int is_sq = (Bz_src == E->Az);
         avx2_sub_dif(rowA, C, E->sub_re, E->sub_im);
-        if (!b_is_trunk) avx2_sub_dif(rowB, C, E->sub_re, E->sub_im);
+        if (!b_is_trunk && !is_sq) avx2_sub_dif(rowB, C, E->sub_re, E->sub_im);
         for (size_t j = 0; j < C; j += 8) {
             for (int h = 0; h < 2; h++) {
                 size_t off = 2 * j + (size_t)h * 4;
@@ -1791,8 +1963,9 @@ XC_TARGET_AVX512 static void pass2_convolve_avx512_row(const xc_plan_t *E, const
     for (int r = r_beg; r < r_end; r++) {
         double *rowA = E->Az + (size_t)r * C * 2;
         double *rowB = (double *)(uintptr_t)(Bz_src + (size_t)r * C * 2);
+        int is_sq = (Bz_src == E->Az);
         sub_dif_avx512(rowA, C, E->sub_re, E->sub_im);
-        if (!b_is_trunk) sub_dif_avx512(rowB, C, E->sub_re, E->sub_im);
+        if (!b_is_trunk && !is_sq) sub_dif_avx512(rowB, C, E->sub_re, E->sub_im);
         for (size_t j = 0; j < C; j += 8) {
             __m512d ar = _mm512_loadu_pd(rowA + 2*j), ai = _mm512_loadu_pd(rowA + 2*j + 8);
             __m512d br = _mm512_loadu_pd(rowB + 2*j), bi = _mm512_loadu_pd(rowB + 2*j + 8);
@@ -2208,7 +2381,16 @@ static void xc_ntt_destroy(xc_ntt_engine_t *eng) {
     free(eng);
 }
 
-static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch) {
+static int xc_ntt_ensure_B(xc_ntt_engine_t *eng) {
+    if (eng->B1 && eng->B2) return XC_OK;
+    size_t mat_bytes = eng->R * eng->stride * 8;
+    int huge = (mat_bytes >= (2ULL << 20));
+    if (!eng->B1) eng->B1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
+    if (!eng->B2) eng->B2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
+    return (eng->B1 && eng->B2) ? XC_OK : XC_ERR_NOMEM;
+}
+
+static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch, int alloc_B) {
     xc_ntt_engine_t *eng = (xc_ntt_engine_t *)calloc(1, sizeof(xc_ntt_engine_t));
     if (!eng) return NULL;
     eng->logN = logN;
@@ -2233,14 +2415,17 @@ static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch) {
     int huge = (mat_bytes >= (2ULL << 20));
     eng->A1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
     eng->A2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
-    eng->B1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
-    eng->B2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
+    if (alloc_B) {
+        eng->B1 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
+        eng->B2 = (uint64_t *)xc_aligned_alloc_buf(mat_bytes, huge);
+    }
     size_t tbuf_bytes = (size_t)eng->nt * (eng->R + 2) * 8 * 8;
     eng->tbufs1 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, tbuf_bytes >= (2ULL << 20));
     eng->tbufs2 = (uint64_t *)xc_aligned_alloc_buf(tbuf_bytes, tbuf_bytes >= (2ULL << 20));
     size_t cy_bytes = (eng->N / 8) * 8;
     eng->blk_carries = (uint64_t *)xc_aligned_alloc_buf(cy_bytes, cy_bytes >= (2ULL << 20));
-    if (!eng->A1 || !eng->A2 || !eng->B1 || !eng->B2 || !eng->tbufs1 || !eng->tbufs2 || !eng->blk_carries) {
+    if (!eng->A1 || !eng->A2 || (alloc_B && (!eng->B1 || !eng->B2)) ||
+        !eng->tbufs1 || !eng->tbufs2 || !eng->blk_carries) {
         xc_ntt_destroy(eng); return NULL;
     }
 
@@ -2250,7 +2435,8 @@ static xc_ntt_engine_t *xc_ntt_create(int logN, int pre_touch) {
         #pragma omp parallel for num_threads(eng->nt) schedule(static)
         for (pg = 0; pg < n_pg; pg++) {
             size_t i = (size_t)pg * 512;
-            eng->A1[i] = 0; eng->A2[i] = 0; eng->B1[i] = 0; eng->B2[i] = 0;
+            eng->A1[i] = 0; eng->A2[i] = 0;
+            if (alloc_B) { eng->B1[i] = 0; eng->B2[i] = 0; }
         }
         memset(eng->blk_carries, 0, cy_bytes);
     }
@@ -2433,6 +2619,17 @@ XC_TARGET_IFMA_NTT static void ntt_row_fused_convolve_C(uint64_t * restrict rowA
         __m512i a = _mm512_load_si512((const __m512i *)(rowA + c));
         __m512i b = _mm512_load_si512((const __m512i *)(rowB + c));
         _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont52(a, b, vP, vPinv, z));
+    }
+    ntt_row_idit_C(rowA, pr);
+}
+
+XC_TARGET_IFMA_NTT static void ntt_row_fused_square_C(uint64_t * restrict rowA, const xc_ntt_prime_t *pr) {
+    ntt_row_dif_C(rowA, pr);
+    const size_t C = pr->C;
+    const __m512i vP = _mm512_set1_epi64((long long)pr->P), vPinv = _mm512_set1_epi64((long long)pr->pinv52), z = _mm512_setzero_si512();
+    for (size_t c = 0; c < C; c += 8) {
+        __m512i a = _mm512_load_si512((const __m512i *)(rowA + c));
+        _mm512_store_si512((__m512i *)(rowA + c), ntt_mul_mont52(a, a, vP, vPinv, z));
     }
     ntt_row_idit_C(rowA, pr);
 }
@@ -2846,7 +3043,75 @@ static void ntt_exec_trunk_mul(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u
     }
     ntt_resolve_block_carries(out, out_u64, eng->blk_carries, nt);
 }
+
+static void ntt_exec_square(xc_ntt_engine_t *eng, uint64_t *out, size_t out_u64,
+                            const uint64_t *a, size_t na)
+{
+    const int n_tiles8 = (int)(eng->C / 8), R_i = (int)eng->R, nt = eng->nt;
+    const size_t tstride = (eng->R + 2) * 8;
+    #pragma omp parallel num_threads(nt)
+    {
+#ifdef _OPENMP
+        int tid = omp_get_thread_num();
+#else
+        int tid = 0;
+#endif
+        uint64_t *tb1 = eng->tbufs1 + (size_t)tid * tstride;
+        uint64_t *tb2 = eng->tbufs2 + (size_t)tid * tstride;
+        int t, r;
+        #pragma omp for schedule(static)
+        for (t = 0; t < n_tiles8; t++)
+            ntt_unpack_col_dif_dual_tile8(eng->A1, eng->A2, eng->stride, (const uint8_t *)a, na * 8, (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2);
+        ntt_sfence();
+        #pragma omp for schedule(static)
+        for (r = 0; r < R_i; r++) {
+            ntt_row_fused_square_C(eng->A1 + (size_t)r * eng->stride, &eng->pr1);
+            ntt_row_fused_square_C(eng->A2 + (size_t)r * eng->stride, &eng->pr2);
+        }
+        #pragma omp for schedule(static)
+        for (t = 0; t < n_tiles8; t++)
+            ntt_col_idit_crt_pack_tile8(eng->A1, eng->A2, eng->stride, out, out_u64, eng->blk_carries,
+                                        (size_t)t, tb1, tb2, &eng->pr1, &eng->pr2, eng->invP1_wm, eng->invP1_wp);
+    }
+    ntt_resolve_block_carries(out, out_u64, eng->blk_carries, nt);
+}
+
+static xc_ntt_engine_t *g_cached_ntt = NULL;
+
+static xc_ntt_engine_t *xc_ntt_acquire_cached(int logN, int need_B) {
+    xc_ntt_engine_t *eng = __atomic_exchange_n(&g_cached_ntt, NULL, __ATOMIC_ACQUIRE);
+    int cur_nt = xc_wave_threads(1ULL << logN);
+    if (eng && (eng->logN != logN || eng->nt != cur_nt)) {
+        xc_ntt_destroy(eng);
+        eng = NULL;
+    }
+    if (!eng) {
+        eng = xc_ntt_create(logN, 0, need_B);
+    } else if (need_B && xc_ntt_ensure_B(eng) != XC_OK) {
+        xc_ntt_destroy(eng);
+        return NULL;
+    }
+    return eng;
+}
+
+static void xc_ntt_release_cached(xc_ntt_engine_t *eng) {
+    if (!eng) return;
+    xc_ntt_engine_t *prev = __atomic_exchange_n(&g_cached_ntt, eng, __ATOMIC_ACQ_REL);
+    if (prev) xc_ntt_destroy(prev);
+}
+
+__attribute__((destructor)) static void xc_ntt_cleanup_cache_at_exit(void) {
+    xc_ntt_engine_t *eng = __atomic_exchange_n(&g_cached_ntt, NULL, __ATOMIC_ACQUIRE);
+    if (eng) xc_ntt_destroy(eng);
+}
 #endif /* XC_HAS_X86_SIMD */
+
+static inline int xc_is_same_operand(const uint64_t *a, size_t na, const uint64_t *b, size_t nb) {
+    if (na != nb || na == 0) return 0;
+    if (a == b) return 1;
+    if (a[0] != b[0] || a[na - 1] != b[nb - 1] || a[na >> 1] != b[nb >> 1]) return 0;
+    return memcmp(a, b, na * sizeof(uint64_t)) == 0;
+}
 
 static int should_use_ifma_ntt(size_t max_na, size_t max_nb, int *out_logN) {
 #if XC_HAS_X86_SIMD
@@ -2878,7 +3143,7 @@ XC_API xc_plan_t *xc_plan_create(size_t max_na, size_t max_nb) {
     if (should_use_ifma_ntt(max_na, max_nb, &logN)) {
         xc_plan_t *plan = (xc_plan_t *)calloc(1, sizeof(xc_plan_t));
         if (!plan) return NULL;
-        plan->ntt = xc_ntt_create(logN, 1);
+        plan->ntt = xc_ntt_create(logN, 1, 1);
         if (!plan->ntt) { free(plan); return NULL; }
         plan->is_ntt = 1;
         plan->limb_bits = 40;
@@ -2935,7 +3200,12 @@ XC_API int xc_plan_mul(xc_plan_t *plan, uint64_t *out,
         size_t active_out = na + nb;
         if (orig_out > active_out) memset(out + active_out, 0, (orig_out - active_out) * sizeof(uint64_t));
         g_last_bits = 40;
-        ntt_exec_cold(plan->ntt, out, active_out, a, na, b, nb);
+        if (xc_is_same_operand(a, na, b, nb)) {
+            ntt_exec_square(plan->ntt, out, active_out, a, na);
+        } else {
+            if (xc_ntt_ensure_B(plan->ntt) != XC_OK) return XC_ERR_NOMEM;
+            ntt_exec_cold(plan->ntt, out, active_out, a, na, b, nb);
+        }
         g_last_path = XC_PATH_WAVE_COLD;
         return XC_OK;
     }
@@ -2951,6 +3221,14 @@ XC_API int xc_plan_mul(xc_plan_t *plan, uint64_t *out,
 
     memset(out, 0, orig_out * sizeof(uint64_t));
     g_last_bits = B;
+
+    if (xc_is_same_operand(a, na, b, nb)) {
+        dispatch_pass1_single(plan, a, na, plan->Az);
+        dispatch_pass2(plan, plan->Az, 0);
+        dispatch_pass3(plan, out, orig_out);
+        g_last_path = XC_PATH_WAVE_COLD;
+        return XC_OK;
+    }
 
 #if XC_HAS_X86_SIMD
     if (plan->isa == XC_ISA_AVX512) {
@@ -3140,11 +3418,13 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
     {
         int logN = 0;
         if (should_use_ifma_ntt(na, nb, &logN)) {
-            xc_ntt_engine_t *eng = xc_ntt_create(logN, 0);
+            int is_sq = xc_is_same_operand(a, na, b, nb);
+            xc_ntt_engine_t *eng = xc_ntt_acquire_cached(logN, !is_sq);
             if (!eng) return XC_ERR_NOMEM;
             g_last_bits = 40;
-            ntt_exec_cold(eng, out, na + nb, a, na, b, nb);
-            xc_ntt_destroy(eng);
+            if (is_sq) ntt_exec_square(eng, out, na + nb, a, na);
+            else       ntt_exec_cold(eng, out, na + nb, a, na, b, nb);
+            xc_ntt_release_cached(eng);
             g_last_path = XC_PATH_WAVE_COLD;
             return XC_OK;
         }
@@ -3161,7 +3441,8 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
     /* 6) Crandall-Fagin Adaptive B-Bit Vedic Vinculum Wave Engine */
     xc_plan_t plan;
     memset(&plan, 0, sizeof(plan));
-    if (plan_init_internal(&plan, B, log_c, 1) != XC_OK) {
+    int is_sq_wave = xc_is_same_operand(a, na, b, nb);
+    if (plan_init_internal(&plan, B, log_c, !is_sq_wave) != XC_OK) {
         plan_free_internal(&plan);
         return XC_ERR_NOMEM;
     }
@@ -3696,11 +3977,7 @@ XC_API int xc_pi_hex_digits(uint64_t hex_offset, char *out_hex, size_t num_digit
         const uint64_t n_blk6 = (k_lim + 1) / 6;
         const uint64_t chunk_sz = 128ULL;
         const int n_chunks = (int)((n_blk6 + chunk_sz - 1ULL) / chunk_sz);
-#ifdef _OPENMP
-        int max_t = omp_get_max_threads();
-#else
-        int max_t = 1;
-#endif
+        int max_t = xc_compute_threads();
         int ch;
         #pragma omp parallel num_threads(max_t)
         {
@@ -3724,11 +4001,7 @@ XC_API int xc_pi_hex_digits(uint64_t hex_offset, char *out_hex, size_t num_digit
         const uint64_t total_k = k_lim + 12ULL;
         const uint64_t chunk_k = 512ULL;
         const int n_chunks = (int)((total_k + chunk_k - 1ULL) / chunk_k);
-#ifdef _OPENMP
-        int max_t = omp_get_max_threads();
-#else
-        int max_t = 1;
-#endif
+        int max_t = xc_compute_threads();
         int ch;
         #pragma omp parallel num_threads(max_t)
         {

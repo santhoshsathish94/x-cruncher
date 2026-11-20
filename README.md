@@ -1,23 +1,24 @@
 # x-cruncher
 
-**`x-cruncher`** is a zero-dependency, **MIT-licensed** arbitrary-precision integer multiplication & zero-storage $\pi$ extraction engine in C11 (with zero-dependency Python `ctypes` bindings) that delivers **`12×–37×` multi-core speedups** (`up to 209×` on sparse near-$2^k$ inputs) over standard open-source libraries (`GNU GMP`, `FLINT`) **and outperforms closed-source `y-cruncher v0.8.7` (`22-ZN4 ~ Kizuna`) on both `100M × 100M` dense multiplication (`61.64 ms` Cold / `45.71 ms` Trunk) and `100M` / `1B` zero-storage $\pi$ BBP extraction (`61.94 ms` vs `75.00 ms`)** — with **100% deterministic integer/worst-case exactness** on every possible input bit-pattern.
+**`x-cruncher`** is a zero-dependency, **MIT-licensed** arbitrary-precision integer multiplication & zero-storage $\pi$ extraction engine in C11 (with zero-dependency Python `ctypes` bindings) that delivers **`13×–41×` multi-core speedups** (`up to 213×` on sparse near-$2^k$ inputs) over standard open-source libraries (`GNU GMP`, `FLINT`) **and outperforms closed-source `y-cruncher v0.8.7` (`22-ZN4 ~ Kizuna`) on both `100M × 100M` dense multiplication (`63.69 ms` Cold / `46.83 ms` Trunk / `41.18 ms` Square) and `100M` / `1B` zero-storage $\pi$ BBP extraction (`62.54 ms` vs `75.00 ms`)** — with **100% deterministic integer/worst-case exactness** on every possible input bit-pattern.
 
 ---
 
 ## Verified Benchmarks (`AMD Ryzen 9 7950X3D`, 16 Physical Zen 4 Cores, DDR5)
 
-All timings below are produced directly by `./bench_xcruncher --100m` (`make bench-100m`, plain `-O3` with runtime `AVX-512 IFMA52` dispatch) in `v1.3.0`, and verified bit-for-bit (`memcmp == 0`) against `GNU GMP 6.3.0`'s `x86-64` assembly `__gmpn_mul_n` on **both** dense-random and pathological worst-case (`0xFFFFFFFF...` / `all +max` limb) inputs:
+All timings below are produced directly by `./bench_xcruncher --100m` (`make bench-100m`, plain `-O3` with runtime `AVX-512 IFMA52` dispatch) in `v1.4.0`, and verified bit-for-bit (`memcmp == 0`) against `GNU GMP 6.3.0`'s `x86-64` assembly `__gmpn_mul_n` on **both** dense-random and pathological worst-case (`0xFFFFFFFF...` / `all +max` limb) inputs:
 
-| Input Size (Decimal Digits) | Active Exact Engine | `GNU GMP 6.3.0` (`__gmpn_mul_n`, 1T) | `x-cruncher v1.3.0` Cold `A * B` | `x-cruncher v1.3.0` `Trunk(B) * A` | `x-cruncher` Near-$2^k$ Sparse (`NAF`) |
-| ---: | :---: | ---: | ---: | ---: | ---: |
-| **`1,024 × 1,024`** | `64-bit` Karatsuba | `0.02 ms` | **`0.0024 ms`** | — | **`< 0.001 ms`** |
-| **`100,000 × 100,000`** | `16-bit` ZMM Wave | `0.82 ms` | **`0.19 ms` (`4.2×`)** | **`0.13 ms` (`6.1×`)** | **`0.01 ms` (`98.9×`)** |
-| **`1,000,000 × 1,000,000`** | `40-bit` `IFMA52` NTT | `9.99 ms` | **`0.84 ms` (`11.9×`)** | **`0.59 ms` (`16.8×`)** | **`0.06 ms` (`161.9×`)** |
-| **`10,000,000 × 10,000,000`** | `40-bit` `IFMA52` NTT | `130.58 ms` | **`6.93 ms` (`18.8×`)** | **`3.50 ms` (`37.4×`)** | **`0.85 ms` (`154.5×`)** |
-| **`100,000,000 × 100,000,000`** | `40-bit` `IFMA52` NTT | `1,694.73 ms` | **`61.64 ms` (`27.5×`)** | **`45.71 ms` (`37.1×`)** | **`8.22 ms` (`206.1×`)** |
+| Input Size (Decimal Digits) | Active Exact Engine | `GNU GMP 6.3.0` (`__gmpn_mul_n`, 1T) | `x-cruncher` Cold `A * B` | `x-cruncher` Square `A * A` | `x-cruncher` `Trunk(B) * A` | `x-cruncher` Sparse (`NAF`) |
+| ---: | :---: | ---: | ---: | ---: | ---: | ---: |
+| **`1,024 × 1,024`** | `64-bit` Karatsuba | `0.01 ms` | **`0.0024 ms`** | **`0.0024 ms`** | — | **`< 0.001 ms`** |
+| **`100,000 × 100,000`** | `16-bit` ZMM Wave | `0.71 ms` | **`0.19 ms`** | **`0.21 ms`** | **`0.14 ms` (`5.1×`)** | **`0.01 ms` (`85×`)** |
+| **`1,000,000 × 1,000,000`** | `40-bit` `IFMA52` NTT | `9.55 ms` | **`0.71 ms` (`13.4×`)** | **`0.56 ms` (`17.1×`)** | **`0.50 ms` (`18.9×`)** | **`0.06 ms` (`161×`)** |
+| **`10,000,000 × 10,000,000`** | `40-bit` `IFMA52` NTT | `126.31 ms` | **`6.84 ms` (`18.5×`)** | **`4.43 ms` (`28.5×`)** | **`4.49 ms` (`28.2×`)** | **`0.79 ms` (`160×`)** |
+| **`100,000,000 × 100,000,000`** | `40-bit` `IFMA52` NTT | `1,703.21 ms` | **`63.69 ms` (`26.7×`)** | **`41.18 ms` (`41.4×`)** | **`46.83 ms` (`36.4×`)** | **`8.00 ms` (`213×`)** |
 
-*Note on architecture & worst-case exactness:*
-- **On `AVX-512 IFMA52` CPUs (`AMD Zen 4 / Zen 5`, `Intel Ice Lake+`):** Above `~400K` digits (`logN >= 17`), `x-cruncher v1.3.0` dispatches to a **Shoup–Seiler 2-Prime `52-bit` Four-Step Radix-4 Exact Integer NTT** ($P_1 = \text{0xffffe20000001}$, $P_2 = \text{0xffffe08000001}$, $P_1 P_2 \approx 2^{104}$) over unsigned `40-bit` (`5-byte`) limbs — eliminating `100%` of floating-point rounding on all inputs while shrinking `100M`-digit transform arrays from `671 MB` to **`134 MB`** (`4096 × 4096`, `32 KB` L1-resident rows) to hit **`61.64 ms` Cold / `45.71 ms` Trunk**!
+*Note on architecture, container/VM thread scaling, & exactness:*
+- **On `AVX-512 IFMA52` CPUs (`AMD Zen 4 / Zen 5`, `Intel Ice Lake+`):** Above `~400K` digits (`logN >= 17`), `x-cruncher v1.4.0` dispatches to a **Shoup–Seiler 2-Prime `52-bit` Four-Step Radix-4 Exact Integer NTT** ($P_1 = \text{0xffffe20000001}$, $P_2 = \text{0xffffe08000001}$, $P_1 P_2 \approx 2^{104}$) over unsigned `40-bit` (`5-byte`) limbs — eliminating `100%` of floating-point rounding on all inputs while shrinking `100M`-digit transform arrays from `671 MB` to **`134 MB`** (`4096 × 4096`, `32 KB` L1-resident rows) to hit **`63.69 ms` Cold / `46.83 ms` Trunk / `41.18 ms` One-Shot Square (`A * A`, `~450 MB` RSS)**!
+- **Universal Topology & Container Cgroup Quota Detection:** Automatically inspects `OMP_NUM_THREADS`, Linux `sched_getaffinity` per-core `(package_id, core_id)` pairs, Linux cgroup v1/v2 CPU quotas (`/sys/fs/cgroup/cpu.max`), Windows physical core descriptors, and Apple Silicon topology so 4–12 vCPU cloud VMs/containers utilize `100%` of their allocated vCPUs without CFS throttling or false SMT halving.
 - **On `AVX2+FMA` / non-`IFMA52` `AVX-512` / `ARM64` CPUs:** Automatically falls back to the adaptive `10..16`-bit Crandall–Fagin Vedic Wave Engine (`choose_wave_params()`), enforcing $L \cdot 2^{2B-2} \le 4.398 \times 10^{13} < 2^{53}/204$ (`1 ULP <= 1/128`) so **every input bit-pattern remains provably exact** on every CPU.
 
 ### Zero-Storage $N$-th Hexadecimal $\pi$ Digit Extraction (`xc_pi_hex_digits` vs `y-cruncher v0.8.7`)

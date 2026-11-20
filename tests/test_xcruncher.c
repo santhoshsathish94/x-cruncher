@@ -213,6 +213,30 @@ int main(void) {
         xc_plan_destroy(plan);
         free(a); free(b); free(g_cold); free(g_tr); free(exp);
         CHECK(ok_ntt, "Large unbalanced Plan + Trunk (60K words, 2-Prime 52-bit IFMA52 NTT / Wave) exact");
+
+        /* Also verify one-shot Squaring fast-path (both pointer-equal `a, a` and value-equal `a, a_dup`)
+           across Wave tier (4,000 words) and NTT/large tier (32,000 words)! */
+        const size_t n_w = 4000, n_l = 32000;
+        uint64_t *aw = (uint64_t *)malloc(n_w * 8), *aw2 = (uint64_t *)malloc(n_w * 8);
+        uint64_t *gw = (uint64_t *)malloc(2 * n_w * 8), *ew = (uint64_t *)malloc(2 * n_w * 8);
+        for (size_t i = 0; i < n_w; i++) aw[i] = xorshift64(&rng);
+        memcpy(aw2, aw, n_w * 8);
+        ref_mul(ew, aw, n_w, aw, n_w);
+        xc_mul_u64(gw, aw, n_w, aw2, n_w);
+        int ok_sq_w = (memcmp(gw, ew, 2 * n_w * 8) == 0);
+        free(aw); free(aw2); free(gw); free(ew);
+
+        uint64_t *al = (uint64_t *)malloc(n_l * 8), *al2 = (uint64_t *)malloc(n_l * 8);
+        uint64_t *gl = (uint64_t *)malloc(2 * n_l * 8), *el = (uint64_t *)malloc(2 * n_l * 8);
+        for (size_t i = 0; i < n_l; i++) al[i] = (i & 3ULL) ? ~0ULL : xorshift64(&rng);
+        memcpy(al2, al, n_l * 8);
+        ref_mul(el, al, n_l, al, n_l);
+        xc_mul_u64(gl, al, n_l, al2, n_l);
+        int ok_sq_l1 = (memcmp(gl, el, 2 * n_l * 8) == 0);
+        xc_mul_u64(gl, al, n_l, al, n_l);
+        int ok_sq_l2 = (memcmp(gl, el, 2 * n_l * 8) == 0);
+        free(al); free(al2); free(gl); free(el);
+        CHECK(ok_sq_w && ok_sq_l1 && ok_sq_l2, "One-shot Squaring A * A fast-path (pointer-equal & value-equal, Wave + NTT) exact");
     }
 
     /* 7. Decimal string multiplication */
