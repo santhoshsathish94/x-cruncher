@@ -31,3 +31,13 @@ jobs:
 
       - name: Run Python Bindings Suite
         run: python tests/test_python.py
+
+  sanitizers:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run AddressSanitizer + UndefinedBehaviorSanitizer (AVX-512 / AVX2 / Scalar)
+        run: |
+          gcc -O3 -g -Wall -Wextra -Werror -fsanitize=address,undefined -fopenmp -Iinclude tests/test_xcruncher.c src/xcruncher.c -lm -o test_san
+          ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 UBSAN_OPTIONS=print_stacktrace=1:halt_on_error=1 ./test_san

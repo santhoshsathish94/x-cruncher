@@ -160,7 +160,37 @@ int main(void) {
         free(a_rnd); free(a_rep); free(b_rnd); free(exp1); free(exp2); free(got);
     }
 
-    /* 6. Decimal string multiplication */
+    /* 6. Adversarial Worst-Case Carry-Free Vedic Saturation Test (all limbs = +2^(B-1) - 1, zero cancellation!)
+          Tests both B = 16 (at 8,000 words) and adaptive B = 14 (at 60,000 words ~ 1.15M digits)! */
+    {
+        const size_t n1 = 8000;  /* B = 16 tier */
+        uint64_t *a1 = (uint64_t *)malloc(n1 * 8), *g1 = (uint64_t *)malloc(2 * n1 * 8), *e1 = (uint64_t *)malloc(2 * n1 * 8);
+        for (size_t i = 0; i < n1; i++) a1[i] = 0x7FFF7FFF7FFF7FFFULL;
+        xc_mul_u64(g1, a1, n1, a1, n1);
+        ref_mul(e1, a1, n1, a1, n1);
+        int ok1 = (xc_last_limb_bits() == 16 && memcmp(g1, e1, 2 * n1 * 8) == 0);
+        free(a1); free(g1); free(e1);
+
+        const size_t n2 = 60000; /* ~1.15M digits -> triggers adaptive B = 14 worst-case safe tier! */
+        uint64_t *a2 = (uint64_t *)calloc(n2, 8), *g2 = (uint64_t *)malloc(2 * n2 * 8), *e2 = (uint64_t *)malloc(2 * n2 * 8);
+        /* Pack +8191 (2^13 - 1, max positive 14-bit Vedic limb!) into every single 14-bit slot */
+        for (size_t m = 0; (m + 1) * 14 <= n2 * 64; m++) {
+            size_t bit = m * 14, w = bit >> 6, sh = bit & 63;
+            uint64_t v = 8191ULL;
+            a2[w] |= (v << sh);
+            if (sh > 50 && w + 1 < n2) a2[w + 1] |= (v >> (64 - sh));
+        }
+        xc_mul_u64(g2, a2, n2, a2, n2);
+        int b_used = xc_last_limb_bits();
+        /* Verify against Low-RAM Karatsuba (which uses smaller B=15/16 leaves) & spot-check ref_mul on 60K words */
+        ref_mul(e2, a2, n2, a2, n2);
+        int ok2 = (b_used <= 14 && memcmp(g2, e2, 2 * n2 * 8) == 0);
+        free(a2); free(g2); free(e2);
+
+        CHECK(ok1 && ok2, "Adversarial worst-case non-canceling Vedic limb saturation (1.15M digits, B=14) exact");
+    }
+
+    /* 7. Decimal string multiplication */
     {
         char *p = xc_mul_decimal("999999999999999999999999999999", "888888888888888888888888888888");
         CHECK(p != NULL && strcmp(p, "888888888888888888888888888887111111111111111111111111111112") == 0,

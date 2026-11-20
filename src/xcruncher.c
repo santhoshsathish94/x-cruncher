@@ -47,6 +47,7 @@
 /* Diagnostic state */
 static xc_path_t g_last_path = XC_PATH_ZERO;
 static int       g_last_uniq = 0;
+static int       g_last_bits = 16;
 
 /* =========================================================================================
  * CROSS-PLATFORM ALIGNED / HUGEPAGE ALLOCATOR & THREAD TOPOLOGY
@@ -168,6 +169,7 @@ XC_API const char *xc_active_isa_name(void) {
 
 XC_API xc_path_t xc_last_path_used(void)    { return g_last_path; }
 XC_API int       xc_last_unique_slices(void){ return g_last_uniq; }
+XC_API int       xc_last_limb_bits(void)    { return g_last_bits; }
 XC_API void      xc_free(void *ptr)         { free(ptr); }
 
 /* =========================================================================================
@@ -511,10 +513,13 @@ static int try_vedic_sparse_mul(uint64_t *out, const uint64_t *a, size_t na,
 }
 
 /* =========================================================================================
- * TIER 3: CRANDALL-FAGIN RIGHT-ANGLE (Y^M + i = 0) 16-BIT VEDIC VINCULUM WAVE ENGINE
- *   Unified AoSoA8 [re[0..7], im[0..7]] memory layout across AVX-512, AVX2+FMA, and Scalar!
+ * TIER 3: CRANDALL-FAGIN RIGHT-ANGLE (Y^M + i = 0) ADAPTIVE B-BIT VEDIC VINCULUM WAVE ENGINE
+ *   Formal Worst-Case Guarantee: B in {10..16} is selected so worst-case adversarial peak
+ *   L * 2^(2B - 2) <= 4.4e13 (< 2^53 / 204 => 1 ULP <= 1/128, max |err| < 0.15 < 0.5)
+ *   for EVERY possible input bit-pattern, not merely random inputs!
  * ========================================================================================= */
 struct xc_plan_s {
+    int      limb_bits;
     int      log_c;
     size_t   C_SUB;
     size_t   M;
@@ -537,6 +542,7 @@ struct xc_plan_s {
 };
 
 struct xc_trunk_s {
+    int     limb_bits;
     int     log_c;
     size_t  C_SUB;
     size_t  M;
@@ -545,20 +551,37 @@ struct xc_trunk_s {
     double *Bz_trunk;
 };
 
-static int choose_log_c(size_t na, size_t nb) {
+static void choose_wave_params(size_t na, size_t nb, int *out_bits, int *out_log_c) {
     size_t max_n = (na > nb) ? na : nb;
-    size_t req_m = max_n * 4ULL + 8ULL; /* uint16_t count + Vedic sign carry */
+    size_t min_n = (na < nb) ? na : nb;
+    if (min_n == 0) min_n = max_n;
+    size_t max_bits = max_n * 64ULL;
+    size_t min_bits = min_n * 64ULL;
+
+    /* Strict worst-case adversarial bound: L_min * 2^(2B - 2) <= 4.398e13 (1 ULP <= 1/128) */
+    int B = 10;
+    for (int cand = 16; cand >= 10; cand--) {
+        size_t L_min = (min_bits + (size_t)cand - 1ULL) / (size_t)cand + 2ULL;
+        uint64_t sq_max = 1ULL << (2 * cand - 2);
+        if ((double)L_min * (double)sq_max <= 4.398e13) {
+            B = cand;
+            break;
+        }
+    }
+    size_t req_m = (max_bits + (size_t)B - 1ULL) / (size_t)B + 8ULL;
     int log_c = 4; /* min C_SUB = 16 => M = 10,240 */
     while (((size_t)R_TOP << log_c) < req_m) log_c++;
-    return log_c;
+    *out_bits  = B;
+    *out_log_c = log_c;
 }
 
-static int plan_init_internal(xc_plan_t *E, int log_c, int alloc_bz) {
+static int plan_init_internal(xc_plan_t *E, int limb_bits, int log_c, int alloc_bz) {
     memset(E, 0, sizeof(*E));
-    E->log_c = log_c;
-    E->C_SUB = (size_t)1ULL << log_c;
-    E->M     = (size_t)R_TOP * E->C_SUB;
-    E->isa   = xc_detect_isa();
+    E->limb_bits = limb_bits;
+    E->log_c     = log_c;
+    E->C_SUB     = (size_t)1ULL << log_c;
+    E->M         = (size_t)R_TOP * E->C_SUB;
+    E->isa       = xc_detect_isa();
 
     for (int i = 0; i < 64; i++) {
         int r = 0;
@@ -646,13 +669,38 @@ static void plan_free_internal(xc_plan_t *E) {
  * ----------------------------------------------------------------------------------------- */
 typedef struct { double v[8]; } vec8d;
 
-static inline void sc_load_vedic8(const uint16_t *A_u16, size_t n_u16, size_t u_pos, vec8d *out) {
-    for (int m = 0; m < 8; m++) {
-        size_t idx = u_pos + (size_t)m;
-        int32_t u  = (idx < n_u16) ? (int32_t)A_u16[idx] : 0;
-        int32_t s  = u >> 15;
-        int32_t sp = (idx > 0 && idx - 1 < n_u16) ? (int32_t)(A_u16[idx - 1] >> 15) : 0;
-        out->v[m]  = (double)(u - (s << 16) + sp);
+static inline void sc_load_vedic8(const uint64_t *A_words, size_t n_words, size_t limb_idx, int B, vec8d *out) {
+    if (B == 16) {
+        const uint16_t *A_u16 = (const uint16_t *)A_words;
+        size_t n_u16 = n_words * 4ULL;
+        for (int m = 0; m < 8; m++) {
+            size_t idx = limb_idx + (size_t)m;
+            int32_t u  = (idx < n_u16) ? (int32_t)A_u16[idx] : 0;
+            int32_t s  = u >> 15;
+            int32_t sp = (idx > 0 && idx - 1 < n_u16) ? (int32_t)(A_u16[idx - 1] >> 15) : 0;
+            out->v[m]  = (double)(u - (s << 16) + sp);
+        }
+    } else {
+        const uint32_t mask1 = (1U << (B + 1)) - 1U;
+        for (int m = 0; m < 8; m++) {
+            size_t bit_m = (limb_idx + (size_t)m) * (size_t)B;
+            uint32_t raw1;
+            if (__builtin_expect(bit_m > 0, 1)) {
+                size_t bp = bit_m - 1;
+                size_t w  = bp >> 6;
+                unsigned sh = (unsigned)(bp & 63U);
+                uint64_t lo = (w < n_words) ? A_words[w] : 0ULL;
+                uint64_t hi = (w + 1 < n_words) ? A_words[w + 1] : 0ULL;
+                uint64_t comb = (sh == 0U) ? lo : ((lo >> sh) | (hi << (64U - sh)));
+                raw1 = (uint32_t)comb & mask1;
+            } else {
+                raw1 = (uint32_t)((n_words > 0 ? A_words[0] : 0ULL) << 1) & mask1;
+            }
+            int32_t sp = (int32_t)(raw1 & 1U);
+            int32_t u  = (int32_t)(raw1 >> 1);
+            int32_t s  = (int32_t)(raw1 >> B);
+            out->v[m]  = (double)(u - (s << B) + sp);
+        }
     }
 }
 
@@ -814,6 +862,7 @@ static void sc_dft640_inv(const vec8d *in_re, const vec8d *in_im, vec8d *out_re,
 }
 
 static void sc_sub_dif(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     for (size_t half = C >> 1, step = 1; half >= 8; half >>= 1, step <<= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
             for (size_t j = 0; j < half; j += 8) {
@@ -833,7 +882,7 @@ static void sc_sub_dif(double *row, size_t C, const double *sub_re, const double
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
         double r[8], im[8];
-        memcpy(r, p, 64); memcpy(im, p + 8, 64);
+        for (int k = 0; k < 8; k++) { r[k] = p[k]; im[k] = p[8 + k]; }
         for (int j = 0; j < 4; j++) {
             double ur = r[j], ui = im[j], vr = r[j+4], vi = im[j+4];
             r[j] = ur + vr; im[j] = ui + vi;
@@ -852,16 +901,17 @@ static void sc_sub_dif(double *row, size_t C, const double *sub_re, const double
             double ur = r[b], ui = im[b], vr = r[b+1], vi = im[b+1];
             r[b] = ur + vr; im[b] = ui + vi; r[b+1] = ur - vr; im[b+1] = ui - vi;
         }
-        memcpy(p, r, 64); memcpy(p + 8, im, 64);
+        for (int k = 0; k < 8; k++) { p[k] = r[k]; p[8 + k] = im[k]; }
     }
 }
 
 static void sc_sub_idit(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     const size_t s4 = C >> 3, s2 = C >> 2;
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
         double r[8], im[8];
-        memcpy(r, p, 64); memcpy(im, p + 8, 64);
+        for (int k = 0; k < 8; k++) { r[k] = p[k]; im[k] = p[8 + k]; }
         for (int b = 0; b < 8; b += 2) {
             double ur = r[b], ui = im[b], vr = r[b+1], vi = im[b+1];
             r[b] = ur + vr; im[b] = ui + vi; r[b+1] = ur - vr; im[b+1] = ui - vi;
@@ -880,7 +930,7 @@ static void sc_sub_idit(double *row, size_t C, const double *sub_re, const doubl
             double tvr = vr*wr + vi*wi, tvi = vi*wr - vr*wi;
             r[j] = ur + tvr; im[j] = ui + tvi; r[j+4] = ur - tvr; im[j+4] = ui - tvi;
         }
-        memcpy(p, r, 64); memcpy(p + 8, im, 64);
+        for (int k = 0; k < 8; k++) { p[k] = r[k]; p[8 + k] = im[k]; }
     }
     for (size_t half = 8, step = (C >> 4); half < C; half <<= 1, step >>= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
@@ -899,9 +949,11 @@ static void sc_sub_idit(double *row, size_t C, const double *sub_re, const doubl
     }
 }
 
-static void pass1_single_scalar(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16, double *DstZ) {
+static void pass1_single_scalar(const xc_plan_t *E, const uint64_t *A_words, size_t n_words, double *DstZ) {
     const size_t C = E->C_SUB, n_vec = C / 8;
-    const int n_nz = (int)((n_u16 + 1 + C - 1) / C);
+    const int B = E->limb_bits;
+    const size_t n_limbs_B = (n_words * 64ULL + (size_t)B - 1ULL) / (size_t)B;
+    const int n_nz = (int)((n_limbs_B + 1 + C - 1) / C);
     int nt = xc_wave_threads(E->M);
 
     #pragma omp parallel num_threads(nt)
@@ -911,7 +963,7 @@ static void pass1_single_scalar(const xc_plan_t *E, const uint16_t *A_u16, size_
         #pragma omp for schedule(static)
         for (v = 0; v < n_vec_i; v++) {
             size_t b0 = (size_t)v * 8;
-            for (int j = 0; j < n_nz; j++) sc_load_vedic8(A_u16, n_u16, (size_t)j * C + b0, &in_re[j]);
+            for (int j = 0; j < n_nz; j++) sc_load_vedic8(A_words, n_words, (size_t)j * C + b0, B, &in_re[j]);
             sc_dft640_fwd_real(in_re, n_nz, out_re, out_im, E);
             for (int r = 0; r < 640; r++) {
                 vec8d tr, ti;
@@ -952,8 +1004,10 @@ static void pass2_convolve_scalar(const xc_plan_t *E, const double *Bz_src, int 
     }
 }
 
-static void ripple_tile_carries(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16) {
-    const size_t total_tiles = (out_n_u16 + 7) / 8;
+static void ripple_tile_carries(xc_plan_t *E, uint16_t *Out_limbs, size_t out_n_limbs) {
+    const int B = E->limb_bits;
+    const int64_t maskB = ((int64_t)1 << B) - 1;
+    const size_t total_tiles = (out_n_limbs + 7) / 8;
     int nt = xc_wave_threads(E->M);
     if (nt > 64) nt = 64;
     int64_t thread_carry_out[64] = {0};
@@ -976,11 +1030,11 @@ static void ripple_tile_carries(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
             run_c = E->tile_carry[t];
             if (c_in != 0) {
                 size_t pos = t * 8, lim = (t + 1) * 8;
-                if (lim > out_n_u16) lim = out_n_u16;
+                if (lim > out_n_limbs) lim = out_n_limbs;
                 for (size_t p = pos; p < lim && c_in != 0; p++) {
-                    int64_t v = (int64_t)Out_u16[p] + c_in;
-                    Out_u16[p] = (uint16_t)(v & 0xFFFF);
-                    c_in = v >> 16;
+                    int64_t v = (int64_t)Out_limbs[p] + c_in;
+                    Out_limbs[p] = (uint16_t)(v & maskB);
+                    c_in = v >> B;
                 }
                 run_c += c_in;
             }
@@ -991,17 +1045,44 @@ static void ripple_tile_carries(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
     for (int tid = 0; tid < nt; tid++) {
         int64_t c = thread_carry_out[tid];
         size_t  p = chunk_end_pos[tid];
-        while (c != 0 && p < out_n_u16) {
-            int64_t v = (int64_t)Out_u16[p] + c;
-            Out_u16[p] = (uint16_t)(v & 0xFFFF);
-            c = v >> 16;
+        while (c != 0 && p < out_n_limbs) {
+            int64_t v = (int64_t)Out_limbs[p] + c;
+            Out_limbs[p] = (uint16_t)(v & maskB);
+            c = v >> B;
             p++;
         }
     }
 }
 
-static void pass3_unpack_scalar(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16) {
+static void pack_b_limbs_to_u64(const xc_plan_t *E, uint64_t *out_words, size_t n_out_words,
+                                const uint16_t *limbs16, size_t n_limbs) {
+    const int B = E->limb_bits;
+    int nt = xc_wave_threads(E->M);
+    int w_i, n_out_i = (int)n_out_words;
+
+    #pragma omp parallel for num_threads(nt) schedule(static)
+    for (w_i = 0; w_i < n_out_i; w_i++) {
+        size_t w = (size_t)w_i;
+        size_t bit0 = w * 64ULL;
+        size_t m0   = bit0 / (size_t)B;
+        unsigned off0 = (unsigned)(bit0 % (size_t)B);
+        uint64_t val = (m0 < n_limbs) ? ((uint64_t)limbs16[m0] >> off0) : 0ULL;
+        unsigned filled = (unsigned)B - off0;
+        for (size_t m = m0 + 1; filled < 64U && m < n_limbs; m++, filled += (unsigned)B) {
+            val |= ((uint64_t)limbs16[m]) << filled;
+        }
+        out_words[w] = val;
+    }
+}
+
+static void pass3_unpack_scalar(xc_plan_t *E, uint64_t *Out_words, size_t n_out_words) {
+    const int B = E->limb_bits;
+    const int64_t maskB = ((int64_t)1 << B) - 1;
     const size_t C = E->C_SUB, M = E->M, n_vec = C / 8, half_tiles = (size_t)R_TOP * n_vec;
+    size_t out_n_limbs = (B == 16) ? (n_out_words * 4ULL)
+                                   : ((n_out_words * 64ULL + (size_t)B - 1ULL) / (size_t)B);
+    if (out_n_limbs > 2 * M) out_n_limbs = 2 * M;
+    uint16_t *Out_limbs = (B == 16) ? (uint16_t *)Out_words : (uint16_t *)E->Bz;
     int nt = xc_wave_threads(E->M);
 
     #pragma omp parallel num_threads(nt)
@@ -1025,30 +1106,31 @@ static void pass3_unpack_scalar(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
 
             for (int j = 0; j < 640; j++) {
                 size_t t_lo = (size_t)j * n_vec + (size_t)v, pos_lo = t_lo * 8;
-                if (pos_lo < out_n_u16) {
+                if (pos_lo < out_n_limbs) {
                     int64_t acc = 0;
                     for (int m = 0; m < 8; m++) {
                         acc += llround(out_re[j].v[m]);
-                        if (pos_lo + (size_t)m < out_n_u16) Out_u16[pos_lo + m] = (uint16_t)(acc & 0xFFFF);
-                        acc >>= 16;
+                        if (pos_lo + (size_t)m < out_n_limbs) Out_limbs[pos_lo + m] = (uint16_t)(acc & maskB);
+                        acc >>= B;
                     }
                     E->tile_carry[t_lo] = acc;
                 } else E->tile_carry[t_lo] = 0;
 
                 size_t t_hi = half_tiles + t_lo, pos_hi = M + pos_lo;
-                if (pos_hi < out_n_u16) {
+                if (pos_hi < out_n_limbs) {
                     int64_t acc = 0;
                     for (int m = 0; m < 8; m++) {
                         acc += llround(-out_im[j].v[m]);
-                        if (pos_hi + (size_t)m < out_n_u16) Out_u16[pos_hi + m] = (uint16_t)(acc & 0xFFFF);
-                        acc >>= 16;
+                        if (pos_hi + (size_t)m < out_n_limbs) Out_limbs[pos_hi + m] = (uint16_t)(acc & maskB);
+                        acc >>= B;
                     }
                     E->tile_carry[t_hi] = acc;
                 } else E->tile_carry[t_hi] = 0;
             }
         }
     }
-    ripple_tile_carries(E, Out_u16, out_n_u16);
+    ripple_tile_carries(E, Out_limbs, out_n_limbs);
+    if (B != 16) pack_b_limbs_to_u64(E, Out_words, n_out_words, Out_limbs, out_n_limbs);
 }
 
 #if XC_HAS_X86_SIMD
@@ -1068,23 +1150,24 @@ static void pass3_unpack_scalar(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
 } while (0)
 
 XC_TARGET_AVX2 static void avx2_sub_dif(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     for (size_t half = C >> 1, step = 1; half >= 8; half >>= 1, step <<= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
             for (size_t j = 0; j < half; j += 8) {
                 double *p0 = row + (base + j) * 2, *p1 = row + (base + j + half) * 2;
                 for (int h = 0; h < 2; h++) {
                     size_t off = (size_t)h * 4;
-                    __m256d ur = _mm256_load_pd(p0 + off),     ui = _mm256_load_pd(p0 + 8 + off);
-                    __m256d vr = _mm256_load_pd(p1 + off),     vi = _mm256_load_pd(p1 + 8 + off);
-                    __m256d dr = _mm256_sub_pd(ur, vr),        di = _mm256_sub_pd(ui, vi);
-                    _mm256_store_pd(p0 + off,     _mm256_add_pd(ur, vr));
-                    _mm256_store_pd(p0 + 8 + off, _mm256_add_pd(ui, vi));
+                    __m256d ur = _mm256_loadu_pd(p0 + off),     ui = _mm256_loadu_pd(p0 + 8 + off);
+                    __m256d vr = _mm256_loadu_pd(p1 + off),     vi = _mm256_loadu_pd(p1 + 8 + off);
+                    __m256d dr = _mm256_sub_pd(ur, vr),         di = _mm256_sub_pd(ui, vi);
+                    _mm256_storeu_pd(p0 + off,     _mm256_add_pd(ur, vr));
+                    _mm256_storeu_pd(p0 + 8 + off, _mm256_add_pd(ui, vi));
                     size_t tk0 = (j + off) * step;
                     __m256d wr = _mm256_setr_pd(sub_re[tk0], sub_re[tk0+step], sub_re[tk0+2*step], sub_re[tk0+3*step]);
                     __m256d wi = _mm256_setr_pd(sub_im[tk0], sub_im[tk0+step], sub_im[tk0+2*step], sub_im[tk0+3*step]);
                     __m256d or_, oi_;
                     CMUL256(dr, di, wr, wi, or_, oi_);
-                    _mm256_store_pd(p1 + off, or_); _mm256_store_pd(p1 + 8 + off, oi_);
+                    _mm256_storeu_pd(p1 + off, or_); _mm256_storeu_pd(p1 + 8 + off, oi_);
                 }
             }
         }
@@ -1097,14 +1180,12 @@ XC_TARGET_AVX2 static void avx2_sub_dif(double *row, size_t C, const double *sub
 
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
-        __m256d r0 = _mm256_load_pd(p),     r1 = _mm256_load_pd(p + 4);
-        __m256d i0 = _mm256_load_pd(p + 8), i1 = _mm256_load_pd(p + 12);
-        /* half = 4: r0 +/- r1 */
-        __m256d dr = _mm256_sub_pd(r0, r1), di = _mm256_sub_pd(i0, i1);
-        r0 = _mm256_add_pd(r0, r1);         i0 = _mm256_add_pd(i0, i1);
+        __m256d r0 = _mm256_loadu_pd(p),     r1 = _mm256_loadu_pd(p + 4);
+        __m256d i0 = _mm256_loadu_pd(p + 8), i1 = _mm256_loadu_pd(p + 12);
+        __m256d dr = _mm256_sub_pd(r0, r1),  di = _mm256_sub_pd(i0, i1);
+        r0 = _mm256_add_pd(r0, r1);          i0 = _mm256_add_pd(i0, i1);
         CMUL256(dr, di, w4r, w4i, r1, i1);
 
-        /* half = 2 & 1 on each YMM */
         __m256d yr[2] = {r0, r1}, yi[2] = {i0, i1};
         for (int h = 0; h < 2; h++) {
             __m256d rr = yr[h], ii = yi[h];
@@ -1121,12 +1202,13 @@ XC_TARGET_AVX2 static void avx2_sub_dif(double *row, size_t C, const double *sub
             yr[h] = _mm256_fmadd_pd(sgn1, od_r, ev_r);
             yi[h] = _mm256_fmadd_pd(sgn1, od_i, ev_i);
         }
-        _mm256_store_pd(p, yr[0]);     _mm256_store_pd(p + 4, yr[1]);
-        _mm256_store_pd(p + 8, yi[0]); _mm256_store_pd(p + 12, yi[1]);
+        _mm256_storeu_pd(p, yr[0]);     _mm256_storeu_pd(p + 4, yr[1]);
+        _mm256_storeu_pd(p + 8, yi[0]); _mm256_storeu_pd(p + 12, yi[1]);
     }
 }
 
 XC_TARGET_AVX2 static void avx2_sub_idit(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     const size_t s4 = C >> 3, s2 = C >> 2;
     const __m256d w4r = _mm256_setr_pd(1.0, sub_re[s4], sub_re[2*s4], sub_re[3*s4]);
     const __m256d w4i = _mm256_setr_pd(0.0, sub_im[s4], sub_im[2*s4], sub_im[3*s4]);
@@ -1135,8 +1217,8 @@ XC_TARGET_AVX2 static void avx2_sub_idit(double *row, size_t C, const double *su
 
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
-        __m256d yr[2] = {_mm256_load_pd(p), _mm256_load_pd(p + 4)};
-        __m256d yi[2] = {_mm256_load_pd(p + 8), _mm256_load_pd(p + 12)};
+        __m256d yr[2] = {_mm256_loadu_pd(p), _mm256_loadu_pd(p + 4)};
+        __m256d yi[2] = {_mm256_loadu_pd(p + 8), _mm256_loadu_pd(p + 12)};
         for (int h = 0; h < 2; h++) {
             __m256d rr = yr[h], ii = yi[h];
             __m256d ev_r = _mm256_movedup_pd(rr), od_r = _mm256_unpackhi_pd(rr, rr);
@@ -1154,8 +1236,8 @@ XC_TARGET_AVX2 static void avx2_sub_idit(double *row, size_t C, const double *su
         }
         __m256d vr, vi;
         CMUL256_CONJ(yr[1], yi[1], w4r, w4i, vr, vi);
-        _mm256_store_pd(p,      _mm256_add_pd(yr[0], vr)); _mm256_store_pd(p + 4,  _mm256_sub_pd(yr[0], vr));
-        _mm256_store_pd(p + 8,  _mm256_add_pd(yi[0], vi)); _mm256_store_pd(p + 12, _mm256_sub_pd(yi[0], vi));
+        _mm256_storeu_pd(p,      _mm256_add_pd(yr[0], vr)); _mm256_storeu_pd(p + 4,  _mm256_sub_pd(yr[0], vr));
+        _mm256_storeu_pd(p + 8,  _mm256_add_pd(yi[0], vi)); _mm256_storeu_pd(p + 12, _mm256_sub_pd(yi[0], vi));
     }
     for (size_t half = 8, step = (C >> 4); half < C; half <<= 1, step >>= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
@@ -1163,16 +1245,16 @@ XC_TARGET_AVX2 static void avx2_sub_idit(double *row, size_t C, const double *su
                 double *p0 = row + (base + j) * 2, *p1 = row + (base + j + half) * 2;
                 for (int h = 0; h < 2; h++) {
                     size_t off = (size_t)h * 4;
-                    __m256d ur = _mm256_load_pd(p0 + off), ui = _mm256_load_pd(p0 + 8 + off);
-                    __m256d vr = _mm256_load_pd(p1 + off), vi = _mm256_load_pd(p1 + 8 + off);
+                    __m256d ur = _mm256_loadu_pd(p0 + off), ui = _mm256_loadu_pd(p0 + 8 + off);
+                    __m256d vr = _mm256_loadu_pd(p1 + off), vi = _mm256_loadu_pd(p1 + 8 + off);
                     size_t tk0 = (j + off) * step;
                     __m256d wr = _mm256_setr_pd(sub_re[tk0], sub_re[tk0+step], sub_re[tk0+2*step], sub_re[tk0+3*step]);
                     __m256d wi = _mm256_setr_pd(sub_im[tk0], sub_im[tk0+step], sub_im[tk0+2*step], sub_im[tk0+3*step]);
                     CMUL256_CONJ(vr, vi, wr, wi, vr, vi);
-                    _mm256_store_pd(p0 + off,     _mm256_add_pd(ur, vr));
-                    _mm256_store_pd(p0 + 8 + off, _mm256_add_pd(ui, vi));
-                    _mm256_store_pd(p1 + off,     _mm256_sub_pd(ur, vr));
-                    _mm256_store_pd(p1 + 8 + off, _mm256_sub_pd(ui, vi));
+                    _mm256_storeu_pd(p0 + off,     _mm256_add_pd(ur, vr));
+                    _mm256_storeu_pd(p0 + 8 + off, _mm256_add_pd(ui, vi));
+                    _mm256_storeu_pd(p1 + off,     _mm256_sub_pd(ur, vr));
+                    _mm256_storeu_pd(p1 + 8 + off, _mm256_sub_pd(ui, vi));
                 }
             }
         }
@@ -1194,12 +1276,12 @@ XC_TARGET_AVX2 static void pass2_convolve_avx2(const xc_plan_t *E, const double 
         for (size_t j = 0; j < C; j += 8) {
             for (int h = 0; h < 2; h++) {
                 size_t off = 2 * j + (size_t)h * 4;
-                __m256d ar = _mm256_load_pd(rowA + off),     ai = _mm256_load_pd(rowA + off + 8);
-                __m256d br = _mm256_load_pd(rowB + off),     bi = _mm256_load_pd(rowB + off + 8);
+                __m256d ar = _mm256_loadu_pd(rowA + off),     ai = _mm256_loadu_pd(rowA + off + 8);
+                __m256d br = _mm256_loadu_pd(rowB + off),     bi = _mm256_loadu_pd(rowB + off + 8);
                 __m256d pr, pi;
                 CMUL256(ar, ai, br, bi, pr, pi);
                 if (!b_is_trunk) { pr = _mm256_mul_pd(pr, scale); pi = _mm256_mul_pd(pi, scale); }
-                _mm256_store_pd(rowA + off, pr); _mm256_store_pd(rowA + off + 8, pi);
+                _mm256_storeu_pd(rowA + off, pr); _mm256_storeu_pd(rowA + off + 8, pi);
             }
         }
         avx2_sub_idit(rowA, C, E->sub_re, E->sub_im);
@@ -1384,26 +1466,49 @@ XC_TARGET_AVX512 static void dft640_inv_8x(const __m512d *in_re, const __m512d *
     }
 }
 
-XC_TARGET_AVX512 static inline __m512d load_vedic8_real_512(const uint16_t *A_u16, size_t n_u16, size_t u_pos) {
-    if (__builtin_expect(u_pos > 0 && u_pos + 8 <= n_u16, 1)) {
-        __m128i cur = _mm_loadu_si128((const __m128i *)(A_u16 + u_pos));
-        __m128i prv = _mm_loadu_si128((const __m128i *)(A_u16 + u_pos - 1));
-        __m256i u32 = _mm256_cvtepu16_epi32(cur);
-        __m256i s_cur = _mm256_srli_epi32(u32, 15);
-        __m256i s_prv = _mm256_srli_epi32(_mm256_cvtepu16_epi32(prv), 15);
-        __m256i d32 = _mm256_add_epi32(_mm256_sub_epi32(u32, _mm256_slli_epi32(s_cur, 16)), s_prv);
-        return _mm512_cvtepi32_pd(d32);
-    } else {
-        double dr[8];
-        for (int m = 0; m < 8; m++) {
-            size_t idx = u_pos + (size_t)m;
-            int32_t u  = (idx < n_u16) ? (int32_t)A_u16[idx] : 0;
-            int32_t s  = u >> 15;
-            int32_t sp = (idx > 0 && idx - 1 < n_u16) ? (int32_t)(A_u16[idx - 1] >> 15) : 0;
-            dr[m] = (double)(u - (s << 16) + sp);
+#if defined(__SANITIZE_ADDRESS__)
+  #define XC_STREAM512_PD(ptr, val) _mm512_storeu_pd((ptr), (val))
+#else
+  #define XC_STREAM512_PD(ptr, val) \
+      ((((uintptr_t)(ptr) & 63U) == 0U) ? _mm512_stream_pd((ptr), (val)) : _mm512_storeu_pd((ptr), (val)))
+#endif
+
+XC_TARGET_AVX512 static inline __m512d load_vedic8_real_512(const uint64_t *A_words, size_t n_words, size_t limb_idx, int B) {
+    if (B == 16) {
+        const uint16_t *A_u16 = (const uint16_t *)A_words;
+        size_t n_u16 = n_words * 4ULL;
+        if (__builtin_expect(limb_idx > 0 && limb_idx + 8 <= n_u16, 1)) {
+            __m128i cur = _mm_loadu_si128((const __m128i *)(A_u16 + limb_idx));
+            __m128i prv = _mm_loadu_si128((const __m128i *)(A_u16 + limb_idx - 1));
+            __m256i u32 = _mm256_cvtepu16_epi32(cur);
+            __m256i s_cur = _mm256_srli_epi32(u32, 15);
+            __m256i s_prv = _mm256_srli_epi32(_mm256_cvtepu16_epi32(prv), 15);
+            __m256i d32 = _mm256_add_epi32(_mm256_sub_epi32(u32, _mm256_slli_epi32(s_cur, 16)), s_prv);
+            return _mm512_cvtepi32_pd(d32);
         }
-        return _mm512_loadu_pd(dr);
     }
+    const uint32_t mask1 = (1U << (B + 1)) - 1U;
+    int32_t d_arr[8];
+    for (int m = 0; m < 8; m++) {
+        size_t bit_m = (limb_idx + (size_t)m) * (size_t)B;
+        uint32_t raw1;
+        if (__builtin_expect(bit_m > 0, 1)) {
+            size_t bp = bit_m - 1;
+            size_t w  = bp >> 6;
+            unsigned sh = (unsigned)(bp & 63U);
+            uint64_t lo = (w < n_words) ? A_words[w] : 0ULL;
+            uint64_t hi = (w + 1 < n_words) ? A_words[w + 1] : 0ULL;
+            uint64_t comb = (sh == 0U) ? lo : ((lo >> sh) | (hi << (64U - sh)));
+            raw1 = (uint32_t)comb & mask1;
+        } else {
+            raw1 = (uint32_t)((n_words > 0 ? A_words[0] : 0ULL) << 1) & mask1;
+        }
+        int32_t sp = (int32_t)(raw1 & 1U);
+        int32_t u  = (int32_t)(raw1 >> 1);
+        int32_t s  = (int32_t)(raw1 >> B);
+        d_arr[m] = u - (s << B) + sp;
+    }
+    return _mm512_cvtepi32_pd(_mm256_loadu_si256((const __m256i *)d_arr));
 }
 
 XC_TARGET_AVX512 static inline void lut_fourstep_8x_512(const xc_plan_t *E, size_t b0, int r, __m512d *tr_out, __m512d *ti_out) {
@@ -1424,28 +1529,30 @@ XC_TARGET_AVX512 static inline void lut_fourstep_8x_512(const xc_plan_t *E, size
     *ti_out = _mm512_loadu_pd(ti);
 }
 
-XC_TARGET_AVX512 static void pass1_single_avx512_worker(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16,
+XC_TARGET_AVX512 static void pass1_single_avx512_worker(const xc_plan_t *E, const uint64_t *A_words, size_t n_words,
                                                         double *DstZ, size_t v_beg, size_t v_end) {
     const size_t C = E->C_SUB;
-    const int n_nz = (int)((n_u16 + 1 + C - 1) / C);
+    const int B = E->limb_bits;
+    const size_t n_limbs_B = (n_words * 64ULL + (size_t)B - 1ULL) / (size_t)B;
+    const int n_nz = (int)((n_limbs_B + 1 + C - 1) / C);
     __m512d in_re[640], out_re[640], out_im[640];
     for (size_t v = v_beg; v < v_end; v++) {
         size_t b0 = v * 8;
-        for (int j = 0; j < n_nz; j++) in_re[j] = load_vedic8_real_512(A_u16, n_u16, (size_t)j * C + b0);
+        for (int j = 0; j < n_nz; j++) in_re[j] = load_vedic8_real_512(A_words, n_words, (size_t)j * C + b0, B);
         dft640_fwd_real_8x(in_re, n_nz, out_re, out_im, E);
         for (int r = 0; r < 640; r++) {
             __m512d tr, ti, yr, yi;
             lut_fourstep_8x_512(E, b0, r, &tr, &ti);
             CMUL512(out_re[r], out_im[r], tr, ti, yr, yi);
             double *dst = DstZ + ((size_t)r * C + b0) * 2;
-            _mm512_stream_pd(dst, yr);
-            _mm512_stream_pd(dst + 8, yi);
+            XC_STREAM512_PD(dst, yr);
+            XC_STREAM512_PD(dst + 8, yi);
         }
     }
     _mm_sfence();
 }
 
-static void pass1_single_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16, double *DstZ) {
+static void pass1_single_avx512(const xc_plan_t *E, const uint64_t *A_words, size_t n_words, double *DstZ) {
     const size_t n_vec = E->C_SUB / 8;
     int nt = xc_wave_threads(E->M);
     #pragma omp parallel num_threads(nt)
@@ -1457,22 +1564,25 @@ static void pass1_single_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_
 #endif
         size_t v_beg = (n_vec * (size_t)tid) / (size_t)nthr;
         size_t v_end = (n_vec * (size_t)(tid + 1)) / (size_t)nthr;
-        pass1_single_avx512_worker(E, A_u16, n_u16, DstZ, v_beg, v_end);
+        pass1_single_avx512_worker(E, A_words, n_words, DstZ, v_beg, v_end);
     }
 }
 
-XC_TARGET_AVX512 static void pass1_dual_avx512_worker(const xc_plan_t *E, const uint16_t *A_u16, size_t na_u16,
-                                                      const uint16_t *B_u16, size_t nb_u16, size_t v_beg, size_t v_end) {
+XC_TARGET_AVX512 static void pass1_dual_avx512_worker(const xc_plan_t *E, const uint64_t *A_words, size_t na_words,
+                                                      const uint64_t *B_words, size_t nb_words, size_t v_beg, size_t v_end) {
     const size_t C = E->C_SUB;
-    const int n_nza = (int)((na_u16 + 1 + C - 1) / C);
-    const int n_nzb = (int)((nb_u16 + 1 + C - 1) / C);
+    const int B = E->limb_bits;
+    const size_t na_limbs = (na_words * 64ULL + (size_t)B - 1ULL) / (size_t)B;
+    const size_t nb_limbs = (nb_words * 64ULL + (size_t)B - 1ULL) / (size_t)B;
+    const int n_nza = (int)((na_limbs + 1 + C - 1) / C);
+    const int n_nzb = (int)((nb_limbs + 1 + C - 1) / C);
     __m512d in_re[640], outA_re[640], outA_im[640], outB_re[640], outB_im[640];
     for (size_t v = v_beg; v < v_end; v++) {
         size_t b0 = v * 8;
-        for (int j = 0; j < n_nza; j++) in_re[j] = load_vedic8_real_512(A_u16, na_u16, (size_t)j * C + b0);
+        for (int j = 0; j < n_nza; j++) in_re[j] = load_vedic8_real_512(A_words, na_words, (size_t)j * C + b0, B);
         dft640_fwd_real_8x(in_re, n_nza, outA_re, outA_im, E);
 
-        for (int j = 0; j < n_nzb; j++) in_re[j] = load_vedic8_real_512(B_u16, nb_u16, (size_t)j * C + b0);
+        for (int j = 0; j < n_nzb; j++) in_re[j] = load_vedic8_real_512(B_words, nb_words, (size_t)j * C + b0, B);
         dft640_fwd_real_8x(in_re, n_nzb, outB_re, outB_im, E);
 
         for (int r = 0; r < 640; r++) {
@@ -1481,15 +1591,15 @@ XC_TARGET_AVX512 static void pass1_dual_avx512_worker(const xc_plan_t *E, const 
             CMUL512(outA_re[r], outA_im[r], tr, ti, yar, yai);
             CMUL512(outB_re[r], outB_im[r], tr, ti, ybr, ybi);
             size_t off = ((size_t)r * C + b0) * 2;
-            _mm512_stream_pd(E->Az + off, yar); _mm512_stream_pd(E->Az + off + 8, yai);
-            _mm512_stream_pd(E->Bz + off, ybr); _mm512_stream_pd(E->Bz + off + 8, ybi);
+            XC_STREAM512_PD(E->Az + off, yar); XC_STREAM512_PD(E->Az + off + 8, yai);
+            XC_STREAM512_PD(E->Bz + off, ybr); XC_STREAM512_PD(E->Bz + off + 8, ybi);
         }
     }
     _mm_sfence();
 }
 
-static void pass1_dual_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t na_u16,
-                              const uint16_t *B_u16, size_t nb_u16) {
+static void pass1_dual_avx512(const xc_plan_t *E, const uint64_t *A_words, size_t na_words,
+                              const uint64_t *B_words, size_t nb_words) {
     const size_t n_vec = E->C_SUB / 8;
     int nt = xc_wave_threads(E->M);
     #pragma omp parallel num_threads(nt)
@@ -1501,26 +1611,27 @@ static void pass1_dual_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t 
 #endif
         size_t v_beg = (n_vec * (size_t)tid) / (size_t)nthr;
         size_t v_end = (n_vec * (size_t)(tid + 1)) / (size_t)nthr;
-        pass1_dual_avx512_worker(E, A_u16, na_u16, B_u16, nb_u16, v_beg, v_end);
+        pass1_dual_avx512_worker(E, A_words, na_words, B_words, nb_words, v_beg, v_end);
     }
 }
 
 XC_TARGET_AVX512 static void sub_dif_avx512(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     for (size_t half = C >> 1, step = 1; half >= 8; half >>= 1, step <<= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
             for (size_t j = 0; j < half; j += 8) {
                 double *p0 = row + (base + j) * 2, *p1 = row + (base + j + half) * 2;
-                __m512d u_r = _mm512_load_pd(p0), u_i = _mm512_load_pd(p0 + 8);
-                __m512d v_r = _mm512_load_pd(p1), v_i = _mm512_load_pd(p1 + 8);
+                __m512d u_r = _mm512_loadu_pd(p0), u_i = _mm512_loadu_pd(p0 + 8);
+                __m512d v_r = _mm512_loadu_pd(p1), v_i = _mm512_loadu_pd(p1 + 8);
                 __m512d d_r = _mm512_sub_pd(u_r, v_r), d_i = _mm512_sub_pd(u_i, v_i);
-                _mm512_store_pd(p0, _mm512_add_pd(u_r, v_r));
-                _mm512_store_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
+                _mm512_storeu_pd(p0, _mm512_add_pd(u_r, v_r));
+                _mm512_storeu_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
 
                 double wr_arr[8], wi_arr[8];
                 for (int m = 0; m < 8; m++) { size_t tk = (j + (size_t)m) * step; wr_arr[m] = sub_re[tk]; wi_arr[m] = sub_im[tk]; }
                 __m512d o_r, o_i;
                 CMUL512(d_r, d_i, _mm512_loadu_pd(wr_arr), _mm512_loadu_pd(wi_arr), o_r, o_i);
-                _mm512_store_pd(p1, o_r); _mm512_store_pd(p1 + 8, o_i);
+                _mm512_storeu_pd(p1, o_r); _mm512_storeu_pd(p1 + 8, o_i);
             }
         }
     }
@@ -1539,7 +1650,7 @@ XC_TARGET_AVX512 static void sub_dif_avx512(double *row, size_t C, const double 
 
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
-        __m512d r = _mm512_load_pd(p), i = _mm512_load_pd(p + 8), ur, ui, vr, vi, tr, ti;
+        __m512d r = _mm512_loadu_pd(p), i = _mm512_loadu_pd(p + 8), ur, ui, vr, vi, tr, ti;
         ur = _mm512_permutexvar_pd(lo4, r); ui = _mm512_permutexvar_pd(lo4, i);
         vr = _mm512_permutexvar_pd(hi4, r); vi = _mm512_permutexvar_pd(hi4, i);
         r = _mm512_fmadd_pd(sgn4, vr, ur); i = _mm512_fmadd_pd(sgn4, vi, ui);
@@ -1555,11 +1666,12 @@ XC_TARGET_AVX512 static void sub_dif_avx512(double *row, size_t C, const double 
         ur = _mm512_permutexvar_pd(lo1, r); ui = _mm512_permutexvar_pd(lo1, i);
         vr = _mm512_permutexvar_pd(hi1, r); vi = _mm512_permutexvar_pd(hi1, i);
         r = _mm512_fmadd_pd(sgn1, vr, ur); i = _mm512_fmadd_pd(sgn1, vi, ui);
-        _mm512_store_pd(p, r); _mm512_store_pd(p + 8, i);
+        _mm512_storeu_pd(p, r); _mm512_storeu_pd(p + 8, i);
     }
 }
 
 XC_TARGET_AVX512 static void sub_idit_avx512(double *row, size_t C, const double *sub_re, const double *sub_im) {
+    if (C < 16) return;
     const size_t s4 = C >> 3, s2 = C >> 2;
     const __m512d w4r = _mm512_setr_pd(1.0, sub_re[s4], sub_re[2*s4], sub_re[3*s4], 1.0, sub_re[s4], sub_re[2*s4], sub_re[3*s4]);
     const __m512d w4i = _mm512_setr_pd(0.0, sub_im[s4], sub_im[2*s4], sub_im[3*s4], 0.0, sub_im[s4], sub_im[2*s4], sub_im[3*s4]);
@@ -1575,7 +1687,7 @@ XC_TARGET_AVX512 static void sub_idit_avx512(double *row, size_t C, const double
 
     for (size_t base = 0; base < C; base += 8) {
         double *p = row + base * 2;
-        __m512d r = _mm512_load_pd(p), i = _mm512_load_pd(p + 8), ur, ui, vr, vi, tr, ti;
+        __m512d r = _mm512_loadu_pd(p), i = _mm512_loadu_pd(p + 8), ur, ui, vr, vi, tr, ti;
         ur = _mm512_permutexvar_pd(lo1, r); ui = _mm512_permutexvar_pd(lo1, i);
         vr = _mm512_permutexvar_pd(hi1, r); vi = _mm512_permutexvar_pd(hi1, i);
         r = _mm512_fmadd_pd(sgn1, vr, ur); i = _mm512_fmadd_pd(sgn1, vi, ui);
@@ -1591,20 +1703,20 @@ XC_TARGET_AVX512 static void sub_idit_avx512(double *row, size_t C, const double
         ur = _mm512_permutexvar_pd(lo4, r); ui = _mm512_permutexvar_pd(lo4, i);
         vr = _mm512_permutexvar_pd(hi4, r); vi = _mm512_permutexvar_pd(hi4, i);
         r = _mm512_fmadd_pd(sgn4, vr, ur); i = _mm512_fmadd_pd(sgn4, vi, ui);
-        _mm512_store_pd(p, r); _mm512_store_pd(p + 8, i);
+        _mm512_storeu_pd(p, r); _mm512_storeu_pd(p + 8, i);
     }
 
     for (size_t half = 8, step = (C >> 4); half < C; half <<= 1, step >>= 1) {
         for (size_t base = 0; base < C; base += 2 * half) {
             for (size_t j = 0; j < half; j += 8) {
                 double *p0 = row + (base + j) * 2, *p1 = row + (base + j + half) * 2;
-                __m512d u_r = _mm512_load_pd(p0), u_i = _mm512_load_pd(p0 + 8);
-                __m512d v_r = _mm512_load_pd(p1), v_i = _mm512_load_pd(p1 + 8);
+                __m512d u_r = _mm512_loadu_pd(p0), u_i = _mm512_loadu_pd(p0 + 8);
+                __m512d v_r = _mm512_loadu_pd(p1), v_i = _mm512_loadu_pd(p1 + 8);
                 double wr_arr[8], wi_arr[8];
                 for (int m = 0; m < 8; m++) { size_t tk = (j + (size_t)m) * step; wr_arr[m] = sub_re[tk]; wi_arr[m] = sub_im[tk]; }
                 CMUL512_CONJ(v_r, v_i, _mm512_loadu_pd(wr_arr), _mm512_loadu_pd(wi_arr), v_r, v_i);
-                _mm512_store_pd(p0, _mm512_add_pd(u_r, v_r)); _mm512_store_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
-                _mm512_store_pd(p1, _mm512_sub_pd(u_r, v_r)); _mm512_store_pd(p1 + 8, _mm512_sub_pd(u_i, v_i));
+                _mm512_storeu_pd(p0, _mm512_add_pd(u_r, v_r)); _mm512_storeu_pd(p0 + 8, _mm512_add_pd(u_i, v_i));
+                _mm512_storeu_pd(p1, _mm512_sub_pd(u_r, v_r)); _mm512_storeu_pd(p1 + 8, _mm512_sub_pd(u_i, v_i));
             }
         }
     }
@@ -1619,12 +1731,12 @@ XC_TARGET_AVX512 static void pass2_convolve_avx512_row(const xc_plan_t *E, const
         sub_dif_avx512(rowA, C, E->sub_re, E->sub_im);
         if (!b_is_trunk) sub_dif_avx512(rowB, C, E->sub_re, E->sub_im);
         for (size_t j = 0; j < C; j += 8) {
-            __m512d ar = _mm512_load_pd(rowA + 2*j), ai = _mm512_load_pd(rowA + 2*j + 8);
-            __m512d br = _mm512_load_pd(rowB + 2*j), bi = _mm512_load_pd(rowB + 2*j + 8);
+            __m512d ar = _mm512_loadu_pd(rowA + 2*j), ai = _mm512_loadu_pd(rowA + 2*j + 8);
+            __m512d br = _mm512_loadu_pd(rowB + 2*j), bi = _mm512_loadu_pd(rowB + 2*j + 8);
             __m512d pr, pi;
             CMUL512(ar, ai, br, bi, pr, pi);
             if (!b_is_trunk) { pr = _mm512_mul_pd(pr, scale); pi = _mm512_mul_pd(pi, scale); }
-            _mm512_store_pd(rowA + 2*j, pr); _mm512_store_pd(rowA + 2*j + 8, pi);
+            _mm512_storeu_pd(rowA + 2*j, pr); _mm512_storeu_pd(rowA + 2*j + 8, pi);
         }
         sub_idit_avx512(rowA, C, E->sub_re, E->sub_im);
     }
@@ -1645,8 +1757,10 @@ static void pass2_convolve_avx512(const xc_plan_t *E, const double *Bz_src, int 
     }
 }
 
-XC_TARGET_AVX512 static void pass3_unpack_avx512_worker(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16,
+XC_TARGET_AVX512 static void pass3_unpack_avx512_worker(xc_plan_t *E, uint16_t *Out_limbs, size_t out_n_limbs,
                                                         size_t v_beg, size_t v_end) {
+    const int B = E->limb_bits;
+    const int64_t maskB = ((int64_t)1 << B) - 1;
     const size_t C = E->C_SUB, M = E->M, n_vec = C / 8, half_tiles = (size_t)R_TOP * n_vec;
     __m512d in_re[640], in_im[640], out_re[640], out_im[640];
     const __m512d z0 = _mm512_setzero_pd();
@@ -1654,7 +1768,7 @@ XC_TARGET_AVX512 static void pass3_unpack_avx512_worker(xc_plan_t *E, uint16_t *
         size_t b0 = v * 8;
         for (int r = 0; r < 640; r++) {
             const double *src = E->Az + ((size_t)r * C + b0) * 2;
-            __m512d yr = _mm512_load_pd(src), yi = _mm512_load_pd(src + 8), tr, ti;
+            __m512d yr = _mm512_loadu_pd(src), yi = _mm512_loadu_pd(src + 8), tr, ti;
             lut_fourstep_8x_512(E, b0, r, &tr, &ti);
             CMUL512_CONJ(yr, yi, tr, ti, in_re[r], in_im[r]);
         }
@@ -1662,31 +1776,31 @@ XC_TARGET_AVX512 static void pass3_unpack_avx512_worker(xc_plan_t *E, uint16_t *
 
         for (int j = 0; j < 640; j++) {
             size_t t_lo = (size_t)j * n_vec + v, pos_lo = t_lo * 8;
-            if (pos_lo < out_n_u16) {
+            if (pos_lo < out_n_limbs) {
                 __m512i ir = _mm512_cvt_roundpd_epi64(out_re[j], _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 int64_t rr[8]; _mm512_storeu_si512((__m512i *)rr, ir);
                 int64_t acc = 0;
-                if (__builtin_expect(pos_lo + 8 <= out_n_u16, 1)) {
+                if (__builtin_expect(pos_lo + 8 <= out_n_limbs, 1)) {
                     uint16_t loc[8];
-                    for (int m = 0; m < 8; m++) { acc += rr[m]; loc[m] = (uint16_t)(acc & 0xFFFF); acc >>= 16; }
-                    memcpy(Out_u16 + pos_lo, loc, 16);
+                    for (int m = 0; m < 8; m++) { acc += rr[m]; loc[m] = (uint16_t)(acc & maskB); acc >>= B; }
+                    memcpy(Out_limbs + pos_lo, loc, 16);
                 } else {
-                    for (int m = 0; m < 8; m++) { acc += rr[m]; if (pos_lo + (size_t)m < out_n_u16) Out_u16[pos_lo + m] = (uint16_t)(acc & 0xFFFF); acc >>= 16; }
+                    for (int m = 0; m < 8; m++) { acc += rr[m]; if (pos_lo + (size_t)m < out_n_limbs) Out_limbs[pos_lo + m] = (uint16_t)(acc & maskB); acc >>= B; }
                 }
                 E->tile_carry[t_lo] = acc;
             } else E->tile_carry[t_lo] = 0;
 
             size_t t_hi = half_tiles + t_lo, pos_hi = M + pos_lo;
-            if (pos_hi < out_n_u16) {
+            if (pos_hi < out_n_limbs) {
                 __m512i ii = _mm512_cvt_roundpd_epi64(_mm512_sub_pd(z0, out_im[j]), _MM_FROUND_TO_NEAREST_INT | _MM_FROUND_NO_EXC);
                 int64_t ri[8]; _mm512_storeu_si512((__m512i *)ri, ii);
                 int64_t acc = 0;
-                if (__builtin_expect(pos_hi + 8 <= out_n_u16, 1)) {
+                if (__builtin_expect(pos_hi + 8 <= out_n_limbs, 1)) {
                     uint16_t loc[8];
-                    for (int m = 0; m < 8; m++) { acc += ri[m]; loc[m] = (uint16_t)(acc & 0xFFFF); acc >>= 16; }
-                    memcpy(Out_u16 + pos_hi, loc, 16);
+                    for (int m = 0; m < 8; m++) { acc += ri[m]; loc[m] = (uint16_t)(acc & maskB); acc >>= B; }
+                    memcpy(Out_limbs + pos_hi, loc, 16);
                 } else {
-                    for (int m = 0; m < 8; m++) { acc += ri[m]; if (pos_hi + (size_t)m < out_n_u16) Out_u16[pos_hi + m] = (uint16_t)(acc & 0xFFFF); acc >>= 16; }
+                    for (int m = 0; m < 8; m++) { acc += ri[m]; if (pos_hi + (size_t)m < out_n_limbs) Out_limbs[pos_hi + m] = (uint16_t)(acc & maskB); acc >>= B; }
                 }
                 E->tile_carry[t_hi] = acc;
             } else E->tile_carry[t_hi] = 0;
@@ -1694,8 +1808,13 @@ XC_TARGET_AVX512 static void pass3_unpack_avx512_worker(xc_plan_t *E, uint16_t *
     }
 }
 
-static void pass3_unpack_avx512(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16) {
+static void pass3_unpack_avx512(xc_plan_t *E, uint64_t *Out_words, size_t n_out_words) {
+    const int B = E->limb_bits;
     const size_t n_vec = E->C_SUB / 8;
+    size_t out_n_limbs = (B == 16) ? (n_out_words * 4ULL)
+                                   : ((n_out_words * 64ULL + (size_t)B - 1ULL) / (size_t)B);
+    if (out_n_limbs > 2 * E->M) out_n_limbs = 2 * E->M;
+    uint16_t *Out_limbs = (B == 16) ? (uint16_t *)Out_words : (uint16_t *)E->Bz;
     int nt = xc_wave_threads(E->M);
     #pragma omp parallel num_threads(nt)
     {
@@ -1706,20 +1825,22 @@ static void pass3_unpack_avx512(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u1
 #endif
         size_t v_beg = (n_vec * (size_t)tid) / (size_t)nthr;
         size_t v_end = (n_vec * (size_t)(tid + 1)) / (size_t)nthr;
-        pass3_unpack_avx512_worker(E, Out_u16, out_n_u16, v_beg, v_end);
+        pass3_unpack_avx512_worker(E, Out_limbs, out_n_limbs, v_beg, v_end);
     }
-    ripple_tile_carries(E, Out_u16, out_n_u16);
+    ripple_tile_carries(E, Out_limbs, out_n_limbs);
+    if (B != 16) pack_b_limbs_to_u64(E, Out_words, n_out_words, Out_limbs, out_n_limbs);
 }
 
-XC_TARGET_AVX512 static void pass1_memo_avx512_worker(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16,
+XC_TARGET_AVX512 static void pass1_memo_avx512_worker(const xc_plan_t *E, const uint64_t *A_words, size_t n_words,
                                                       double *DstZ, int U, const int *rep_j,
                                                       const double (*W_re)[44], const double (*W_im)[44],
                                                       size_t v_beg, size_t v_end) {
     const size_t C = E->C_SUB;
+    const int B = E->limb_bits;
     __m512d u_re[44];
     for (size_t v = v_beg; v < v_end; v++) {
         size_t b0 = v * 8;
-        for (int u = 0; u < U; u++) u_re[u] = load_vedic8_real_512(A_u16, n_u16, (size_t)rep_j[u] * C + b0);
+        for (int u = 0; u < U; u++) u_re[u] = load_vedic8_real_512(A_words, n_words, (size_t)rep_j[u] * C + b0, B);
         for (int r = 0; r < 640; r++) {
             __m512d sr = _mm512_setzero_pd(), si = _mm512_setzero_pd();
             for (int u = 0; u < U; u++) {
@@ -1730,13 +1851,13 @@ XC_TARGET_AVX512 static void pass1_memo_avx512_worker(const xc_plan_t *E, const 
             lut_fourstep_8x_512(E, b0, r, &tr, &ti);
             CMUL512(sr, si, tr, ti, yr, yi);
             double *dst = DstZ + ((size_t)r * C + b0) * 2;
-            _mm512_stream_pd(dst, yr); _mm512_stream_pd(dst + 8, yi);
+            XC_STREAM512_PD(dst, yr); XC_STREAM512_PD(dst + 8, yi);
         }
     }
     _mm_sfence();
 }
 
-static void pass1_memo_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16,
+static void pass1_memo_avx512(const xc_plan_t *E, const uint64_t *A_words, size_t n_words,
                               double *DstZ, int U, const int *rep_j, const int *slice_uid, int n_nz) {
     const size_t n_vec = E->C_SUB / 8;
     int nt = xc_wave_threads(E->M);
@@ -1762,7 +1883,7 @@ static void pass1_memo_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t 
 #endif
         size_t v_beg = (n_vec * (size_t)tid) / (size_t)nthr;
         size_t v_end = (n_vec * (size_t)(tid + 1)) / (size_t)nthr;
-        pass1_memo_avx512_worker(E, A_u16, n_u16, DstZ, U, rep_j,
+        pass1_memo_avx512_worker(E, A_words, n_words, DstZ, U, rep_j,
                                  (const double (*)[44])W_re, (const double (*)[44])W_im, v_beg, v_end);
     }
 }
@@ -1771,63 +1892,71 @@ static void pass1_memo_avx512(const xc_plan_t *E, const uint16_t *A_u16, size_t 
 /* -----------------------------------------------------------------------------------------
  * UNIFIED DISPATCH WRAPPERS
  * ----------------------------------------------------------------------------------------- */
-static void dispatch_pass1_single(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16, double *DstZ) {
+static void dispatch_pass1_single(const xc_plan_t *E, const uint64_t *A_words, size_t n_words, double *DstZ) {
 #if XC_HAS_X86_SIMD
-    if (E->isa == XC_ISA_AVX512) { pass1_single_avx512(E, A_u16, n_u16, DstZ); return; }
+    if (E->isa == XC_ISA_AVX512) { pass1_single_avx512(E, A_words, n_words, DstZ); return; }
 #endif
-    pass1_single_scalar(E, A_u16, n_u16, DstZ);
+    pass1_single_scalar(E, A_words, n_words, DstZ);
 }
 
-static int dispatch_pass1_auto_memo(const xc_plan_t *E, const uint16_t *A_u16, size_t n_u16, double *DstZ) {
+static int dispatch_pass1_auto_memo(const xc_plan_t *E, const uint64_t *A_words, size_t n_words, double *DstZ) {
     const size_t C = E->C_SUB;
-    const int n_nz = (int)((n_u16 + 1 + C - 1) / C);
-    const int n_full = (int)(n_u16 / C);
+    const int B = E->limb_bits;
+    const size_t n_limbs_B = (n_words * 64ULL + (size_t)B - 1ULL) / (size_t)B;
+    const int n_nz = (int)((n_limbs_B + 1 + C - 1) / C);
+    const size_t slice_bits = C * (size_t)B;
 
-    if (n_full >= 16) {
-        int slice_uid[640], rep_j[640];
-        uint64_t hashes[640];
-        int nt = xc_wave_threads(E->M);
-        int j_omp;
+    if ((slice_bits & 63ULL) == 0ULL) {
+        const size_t words_per_slice = slice_bits >> 6;
+        const int n_full = (words_per_slice > 0) ? (int)(n_words / words_per_slice) : 0;
 
-        #pragma omp parallel for num_threads(nt) schedule(static)
-        for (j_omp = 0; j_omp < n_full; j_omp++) {
-            const uint64_t *p64 = (const uint64_t *)(A_u16 + (size_t)j_omp * C);
-            size_t n64 = C / 4;
-            uint16_t prev_sign = (j_omp > 0) ? (A_u16[(size_t)j_omp * C - 1] >> 15) : 0;
-            uint64_t h = 14695981039346656037ULL ^ prev_sign;
-            for (size_t k = 0; k < n64; k++) { h ^= p64[k]; h *= 1099511628211ULL; }
-            hashes[j_omp] = h;
-        }
+        if (n_full >= 16) {
+            int slice_uid[640], rep_j[640];
+            uint64_t hashes[640];
+            int nt = xc_wave_threads(E->M);
+            int j_omp;
 
-        int U = 0;
-        for (int j = 0; j < n_full && U <= 40; j++) {
-            uint16_t prev_j = (j > 0) ? (A_u16[(size_t)j * C - 1] >> 15) : 0;
-            int match = -1;
-            for (int u = 0; u < U; u++) {
-                int rj = rep_j[u];
-                uint16_t prev_r = (rj > 0) ? (A_u16[(size_t)rj * C - 1] >> 15) : 0;
-                if (hashes[j] == hashes[rj] && prev_j == prev_r &&
-                    memcmp(A_u16 + (size_t)j * C, A_u16 + (size_t)rj * C, C * 2) == 0) {
-                    match = u; break;
+            #pragma omp parallel for num_threads(nt) schedule(static)
+            for (j_omp = 0; j_omp < n_full; j_omp++) {
+                const uint64_t *p64 = A_words + (size_t)j_omp * words_per_slice;
+                uint64_t prev_sign = (j_omp > 0) ? (A_words[(size_t)j_omp * words_per_slice - 1] >> 63) : 0ULL;
+                uint64_t h = 14695981039346656037ULL ^ prev_sign;
+                for (size_t k = 0; k < words_per_slice; k++) { h ^= p64[k]; h *= 1099511628211ULL; }
+                hashes[j_omp] = h;
+            }
+
+            int U = 0;
+            for (int j = 0; j < n_full && U <= 40; j++) {
+                uint64_t prev_j = (j > 0) ? (A_words[(size_t)j * words_per_slice - 1] >> 63) : 0ULL;
+                int match = -1;
+                for (int u = 0; u < U; u++) {
+                    int rj = rep_j[u];
+                    uint64_t prev_r = (rj > 0) ? (A_words[(size_t)rj * words_per_slice - 1] >> 63) : 0ULL;
+                    if (hashes[j] == hashes[rj] && prev_j == prev_r &&
+                        memcmp(A_words + (size_t)j * words_per_slice,
+                               A_words + (size_t)rj * words_per_slice,
+                               words_per_slice * sizeof(uint64_t)) == 0) {
+                        match = u; break;
+                    }
                 }
+                if (match >= 0) slice_uid[j] = match;
+                else { rep_j[U] = j; slice_uid[j] = U; U++; }
             }
-            if (match >= 0) slice_uid[j] = match;
-            else { rep_j[U] = j; slice_uid[j] = U; U++; }
-        }
-        for (int j = n_full; j < n_nz && U <= 42; j++) { rep_j[U] = j; slice_uid[j] = U; U++; }
+            for (int j = n_full; j < n_nz && U <= 42; j++) { rep_j[U] = j; slice_uid[j] = U; U++; }
 
-        if (U <= 40 && U * 2 < n_nz) {
-            g_last_uniq = U;
+            if (U <= 40 && U * 2 < n_nz) {
+                g_last_uniq = U;
 #if XC_HAS_X86_SIMD
-            if (E->isa == XC_ISA_AVX512) {
-                pass1_memo_avx512(E, A_u16, n_u16, DstZ, U, rep_j, slice_uid, n_nz);
-                return 1;
-            }
+                if (E->isa == XC_ISA_AVX512) {
+                    pass1_memo_avx512(E, A_words, n_words, DstZ, U, rep_j, slice_uid, n_nz);
+                    return 1;
+                }
 #endif
+            }
         }
     }
     g_last_uniq = n_nz;
-    dispatch_pass1_single(E, A_u16, n_u16, DstZ);
+    dispatch_pass1_single(E, A_words, n_words, DstZ);
     return 0;
 }
 
@@ -1839,11 +1968,11 @@ static void dispatch_pass2(const xc_plan_t *E, const double *Bz_src, int b_is_tr
     pass2_convolve_scalar(E, Bz_src, b_is_trunk);
 }
 
-static void dispatch_pass3(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16) {
+static void dispatch_pass3(xc_plan_t *E, uint64_t *Out_words, size_t n_out_words) {
 #if XC_HAS_X86_SIMD
-    if (E->isa == XC_ISA_AVX512) { pass3_unpack_avx512(E, Out_u16, out_n_u16); return; }
+    if (E->isa == XC_ISA_AVX512) { pass3_unpack_avx512(E, Out_words, n_out_words); return; }
 #endif
-    pass3_unpack_scalar(E, Out_u16, out_n_u16);
+    pass3_unpack_scalar(E, Out_words, n_out_words);
 }
 
 /* =========================================================================================
@@ -1851,11 +1980,12 @@ static void dispatch_pass3(xc_plan_t *E, uint16_t *Out_u16, size_t out_n_u16) {
  * ========================================================================================= */
 XC_API xc_plan_t *xc_plan_create(size_t max_na, size_t max_nb) {
     if (max_na == 0 || max_nb == 0) return NULL;
-    int log_c = choose_log_c(max_na, max_nb);
-    if (log_c > 16) return NULL; /* > ~250M input digits per limb array: use xc_mul_u64_lowmem */
+    int B = 16, log_c = 4;
+    choose_wave_params(max_na, max_nb, &B, &log_c);
+    if (log_c > 17) return NULL; /* > ~400M input digits: use xc_mul_u64_lowmem */
     xc_plan_t *plan = (xc_plan_t *)malloc(sizeof(xc_plan_t));
     if (!plan) return NULL;
-    if (plan_init_internal(plan, log_c, 1) != XC_OK) {
+    if (plan_init_internal(plan, B, log_c, 1) != XC_OK) {
         plan_free_internal(plan);
         free(plan);
         return NULL;
@@ -1881,22 +2011,29 @@ XC_API int xc_plan_mul(xc_plan_t *plan, uint64_t *out,
         g_last_path = XC_PATH_ZERO;
         return XC_OK;
     }
-    if (choose_log_c(na, nb) > plan->log_c) return XC_ERR_RANGE;
+
+    int B = plan->limb_bits;
+    size_t max_n = (na > nb) ? na : nb;
+    size_t min_n = (na < nb) ? na : nb;
+    size_t req_limbs = (max_n * 64ULL + (size_t)B - 1ULL) / (size_t)B + 8ULL;
+    size_t min_limbs = (min_n * 64ULL + (size_t)B - 1ULL) / (size_t)B + 2ULL;
+    if (req_limbs > plan->M) return XC_ERR_RANGE;
+    if ((double)min_limbs * (double)(1ULL << (2 * B - 2)) > 4.398e13) return XC_ERR_RANGE;
 
     memset(out, 0, orig_out * sizeof(uint64_t));
-    size_t na_u16 = na * 4, nb_u16 = nb * 4, out_u16 = (na + nb) * 4;
+    g_last_bits = B;
 
 #if XC_HAS_X86_SIMD
     if (plan->isa == XC_ISA_AVX512) {
-        pass1_dual_avx512(plan, (const uint16_t *)a, na_u16, (const uint16_t *)b, nb_u16);
+        pass1_dual_avx512(plan, a, na, b, nb);
     } else
 #endif
     {
-        dispatch_pass1_single(plan, (const uint16_t *)a, na_u16, plan->Az);
-        dispatch_pass1_single(plan, (const uint16_t *)b, nb_u16, plan->Bz);
+        dispatch_pass1_single(plan, a, na, plan->Az);
+        dispatch_pass1_single(plan, b, nb, plan->Bz);
     }
     dispatch_pass2(plan, plan->Bz, 0);
-    dispatch_pass3(plan, (uint16_t *)out, out_u16);
+    dispatch_pass3(plan, out, orig_out);
     g_last_path = XC_PATH_WAVE_COLD;
     return XC_OK;
 }
@@ -1905,21 +2042,24 @@ XC_API xc_trunk_t *xc_trunk_create(const xc_plan_t *plan, const uint64_t *b, siz
     if (!plan || (!b && nb)) return NULL;
     size_t orig_nb = nb;
     while (nb > 0 && b[nb - 1] == 0) nb--;
-    if (nb > 0 && choose_log_c(nb, nb) > plan->log_c) return NULL;
+    int B = plan->limb_bits;
+    size_t req_limbs = (nb * 64ULL + (size_t)B - 1ULL) / (size_t)B + 8ULL;
+    if (nb > 0 && req_limbs > plan->M) return NULL;
 
     xc_trunk_t *T = (xc_trunk_t *)calloc(1, sizeof(xc_trunk_t));
     if (!T) return NULL;
-    T->log_c = plan->log_c;
-    T->C_SUB = plan->C_SUB;
-    T->M     = plan->M;
-    T->nb    = orig_nb;
+    T->limb_bits = B;
+    T->log_c     = plan->log_c;
+    T->C_SUB     = plan->C_SUB;
+    T->M         = plan->M;
+    T->nb        = orig_nb;
     if (nb == 0) { T->is_zero = 1; return T; }
 
     int use_huge = (2 * plan->M * sizeof(double) >= (2ULL << 20));
     T->Bz_trunk = (double *)xc_aligned_alloc_buf(2 * plan->M * sizeof(double), use_huge);
     if (!T->Bz_trunk) { free(T); return NULL; }
 
-    dispatch_pass1_single(plan, (const uint16_t *)b, nb * 4, T->Bz_trunk);
+    dispatch_pass1_single(plan, b, nb, T->Bz_trunk);
     const size_t C = plan->C_SUB;
     const double invM = 1.0 / (double)plan->M;
     int nt = xc_wave_threads(plan->M);
@@ -1950,7 +2090,7 @@ XC_API int xc_mul_trunk(xc_plan_t *plan, uint64_t *out,
                         const uint64_t *a, size_t na,
                         const xc_trunk_t *b_trunk) {
     if (!plan || !out || !b_trunk || (!a && na)) return XC_ERR_ARG;
-    if (plan->log_c != b_trunk->log_c) return XC_ERR_ARG;
+    if (plan->log_c != b_trunk->log_c || plan->limb_bits != b_trunk->limb_bits) return XC_ERR_ARG;
     size_t orig_out = na + b_trunk->nb;
     while (na > 0 && a[na - 1] == 0) na--;
     if (na == 0 || b_trunk->is_zero) {
@@ -1958,12 +2098,18 @@ XC_API int xc_mul_trunk(xc_plan_t *plan, uint64_t *out,
         g_last_path = XC_PATH_ZERO;
         return XC_OK;
     }
-    if (choose_log_c(na, b_trunk->nb) > plan->log_c) return XC_ERR_RANGE;
+    int B = plan->limb_bits;
+    size_t req_limbs = (na * 64ULL + (size_t)B - 1ULL) / (size_t)B + 8ULL;
+    size_t min_n = (na < b_trunk->nb) ? na : b_trunk->nb;
+    size_t min_limbs = (min_n * 64ULL + (size_t)B - 1ULL) / (size_t)B + 2ULL;
+    if (req_limbs > plan->M) return XC_ERR_RANGE;
+    if ((double)min_limbs * (double)(1ULL << (2 * B - 2)) > 4.398e13) return XC_ERR_RANGE;
 
     memset(out, 0, orig_out * sizeof(uint64_t));
-    int used_hash = dispatch_pass1_auto_memo(plan, (const uint16_t *)a, na * 4, plan->Az);
+    g_last_bits = B;
+    int used_hash = dispatch_pass1_auto_memo(plan, a, na, plan->Az);
     dispatch_pass2(plan, b_trunk->Bz_trunk, 1);
-    dispatch_pass3(plan, (uint16_t *)out, orig_out * 4);
+    dispatch_pass3(plan, out, orig_out);
     g_last_path = used_hash ? XC_PATH_WAVE_HASH : XC_PATH_WAVE_TRUNK;
     return XC_OK;
 }
@@ -2007,15 +2153,16 @@ XC_API int xc_mul_u64(uint64_t *out, const uint64_t *a, size_t na,
         return XC_OK;
     }
 
-    /* 4) Ultra-huge fallback (> ~250M input digits): Raw-Bit Karatsuba Top-Split */
-    int log_c = choose_log_c(na, nb);
-    if (log_c > 16) {
+    /* 4) Ultra-huge fallback (> ~400M input digits): Raw-Bit Karatsuba Top-Split */
+    int B = 16, log_c = 4;
+    choose_wave_params(na, nb, &B, &log_c);
+    if (log_c > 17) {
         return xc_mul_u64_lowmem(out, a, na, b, nb);
     }
 
-    /* 5) Crandall-Fagin 16-Bit Vedic Vinculum Wave Engine */
+    /* 5) Crandall-Fagin Adaptive B-Bit Vedic Vinculum Wave Engine */
     xc_plan_t plan;
-    if (plan_init_internal(&plan, log_c, 1) != XC_OK) {
+    if (plan_init_internal(&plan, B, log_c, 1) != XC_OK) {
         plan_free_internal(&plan);
         return XC_ERR_NOMEM;
     }

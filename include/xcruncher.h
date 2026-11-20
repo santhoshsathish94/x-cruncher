@@ -35,7 +35,7 @@ extern "C" {
   #define XC_API
 #endif
 
-#define XCRUNCHER_VERSION "1.0.0"
+#define XCRUNCHER_VERSION "1.1.0"
 
 /* Error / status codes */
 #define XC_OK          0
@@ -115,6 +115,7 @@ XC_API const char *xc_version(void);
 XC_API const char *xc_active_isa_name(void);
 XC_API xc_path_t   xc_last_path_used(void);
 XC_API int         xc_last_unique_slices(void);
+XC_API int         xc_last_limb_bits(void);
 
 #ifdef __cplusplus
 }
